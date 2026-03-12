@@ -40,5 +40,6 @@ do
   --start "${START}" \
   --count "${COUNT}" \
   --voxel_mode fast \
+  --random_downsample 4000 \
   --traj_file gcvo.${SEQ}.connection.kitti 
 done

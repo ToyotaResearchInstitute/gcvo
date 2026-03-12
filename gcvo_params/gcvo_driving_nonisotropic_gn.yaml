@@ -1,6 +1,6 @@
 %YAML:1.0
 ---
-l_init: 0.5
+l_init: 0.1
 l_min: 0.05
 amplitude: 0.1
 sparsity_cutoff: 0.0001
@@ -21,4 +21,4 @@ kernel_type: 1 #0
 kernel_eval_max_dist: 1
 neighbor_decay: 1
 verbose: 0
-use_ema_indicator: 1 # 0=queue (original), 1=EMA
+use_ema_indicator: 0 #1 # 0=queue (original), 1=EMA

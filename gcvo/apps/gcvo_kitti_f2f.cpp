@@ -50,12 +50,14 @@
 #include <pcl/filters/voxel_grid.h>
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -72,7 +74,9 @@ struct Args {
   int start = 0;
   int count = 10;
   bool visualize = false;
-  std::string voxel_mode = "pcl"; // "pcl" or "fast"
+  std::string voxel_mode = "pcl"; // "pcl", "fast", or "none"
+  int random_downsample = 0;      // 0 = disabled; >0 = target number of points
+  int max_iter = 10000;           // overrides yaml max_iterations
 };
 
 static void print_usage(const char* argv0) {
@@ -81,8 +85,12 @@ static void print_usage(const char* argv0) {
       << "  " << argv0
       << " --params <params.yaml> --kitti_root <KITTI_ODOM_ROOT>"
          " [--sequence 00] [--start 0] [--count 10]"
-         " [--traj_file <out.txt>] [--visualize] [--voxel_mode pcl|fast]\n\n"
+         " [--traj_file <out.txt>] [--visualize] [--voxel_mode pcl|fast|none]"
+         " [--random_downsample <N>] [--max_iter <N>]\n\n"
       << "Reads velodyne/*.bin and runs frame-to-frame registration using PointS1 (XYZI).\n"
+      << "--voxel_mode: 'pcl' (default), 'fast', or 'none' to skip voxel downsampling.\n"
+      << "--random_downsample N: randomly subsample to N points (applied after voxel, or alone if voxel_mode=none).\n"
+      << "--max_iter N: override max iterations from YAML (default 10000).\n"
       << "--visualize requires building with -DGCVO_BUILD_VIZ=ON.\n";
 }
 
@@ -104,6 +112,8 @@ static bool parse_args(int argc, char** argv, Args& a) {
     else if (k == "--traj_file") a.traj_file = need("--traj_file");
     else if (k == "--visualize") a.visualize = true;
     else if (k == "--voxel_mode") a.voxel_mode = need("--voxel_mode");
+    else if (k == "--random_downsample") a.random_downsample = std::stoi(need("--random_downsample"));
+    else if (k == "--max_iter") a.max_iter = std::stoi(need("--max_iter"));
     else if (k == "-h" || k == "--help") return false;
     else {
       std::cerr << "Unknown arg: " << k << "\n";
@@ -146,6 +156,9 @@ static pcl::PointCloud<pcl::PointXYZI>::Ptr load_kitti_bin_raw(const std::string
     (*ptr)[i].y = y;
     (*ptr)[i].z = z;
     (*ptr)[i].intensity = r * 255.0f;  // store in [0,255] so GCvoPointCloudT maps to features[0] in [0,1]
+    if (i == 1) {
+      std::cout<<" raw intensity = "<<r<<", p.intensity is "<<(*ptr)[i].intensity<<"\n";
+    }
   }
   return ptr;
 }
@@ -168,6 +181,27 @@ static pcl::PointCloud<pcl::PointXYZI> downsample_fast(
   pcl::PointCloud<pcl::PointXYZI> out;
   out.reserve(sampled.size());
   for (auto* p : sampled) out.push_back(*p);
+  return out;
+}
+
+static pcl::PointCloud<pcl::PointXYZI> downsample_random(
+    const pcl::PointCloud<pcl::PointXYZI>& cloud, int target_n,
+    std::mt19937& rng) {
+  pcl::PointCloud<pcl::PointXYZI> out;
+  const int n = static_cast<int>(cloud.size());
+  if (target_n >= n) {
+    out = cloud;
+    return out;
+  }
+  // Fisher-Yates partial shuffle to pick target_n indices without replacement.
+  std::vector<int> idx(n);
+  std::iota(idx.begin(), idx.end(), 0);
+  for (int i = 0; i < target_n; ++i) {
+    std::uniform_int_distribution<int> dist(i, n - 1);
+    std::swap(idx[i], idx[dist(rng)]);
+  }
+  out.resize(target_n);
+  for (int i = 0; i < target_n; ++i) out[i] = cloud[idx[i]];
   return out;
 }
 
@@ -204,6 +238,7 @@ int main(int argc, char** argv) {
 
   try {
     gcvo::GCvoGPU<gcvo::PointS1> solver(a.params);
+    solver.params().max_iterations = a.max_iter;
 
     std::ofstream traj_ofs;
     if (!a.traj_file.empty()) {
@@ -237,6 +272,8 @@ int main(int argc, char** argv) {
     if (viewer) viewer->add_pose(T_0_i);
 #endif
 
+    std::mt19937 rng(42);  // fixed seed for reproducibility
+
     int frames_processed = 0;
     for (int f = a.start; f < a.start + a.count - 1; ++f) {
       const std::string p0 = kitti_bin_path(a, f);
@@ -255,8 +292,22 @@ int main(int argc, char** argv) {
       // --- Start timing: downsample + covariance + align ---
       const auto t_start = std::chrono::steady_clock::now();
 
-      auto pc0 = (a.voxel_mode == "fast") ? downsample_fast(*raw0) : downsample(raw0);
-      auto pc1 = (a.voxel_mode == "fast") ? downsample_fast(*raw1) : downsample(raw1);
+      // Downsample: voxel first (unless "none"), then random subsample if requested.
+      pcl::PointCloud<pcl::PointXYZI> pc0, pc1;
+      if (a.voxel_mode == "none") {
+        pc0 = *raw0;
+        pc1 = *raw1;
+      } else if (a.voxel_mode == "fast") {
+        pc0 = downsample_fast(*raw0);
+        pc1 = downsample_fast(*raw1);
+      } else {
+        pc0 = downsample(raw0);
+        pc1 = downsample(raw1);
+      }
+      if (a.random_downsample > 0) {
+        pc0 = downsample_random(pc0, a.random_downsample, rng);
+        pc1 = downsample_random(pc1, a.random_downsample, rng);
+      }
       gcvo::GCvoPointCloudT<gcvo::PointS1> src(pc0);
       gcvo::GCvoPointCloudT<gcvo::PointS1> tgt(pc1);
 

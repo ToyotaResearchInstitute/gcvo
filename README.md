@@ -108,10 +108,35 @@ accumulates a trajectory.
   --kitti_root /path/to/kitti/dataset \
   --sequence 09 --start 0 --count 10000 \
   --traj_file kitti_09.txt \
-  --max_iter 40 \            # default: 10000. set to 40 for fast runtime
-  --voxel_mode fast          # pcl (default) or fast (VoxelMapFirstPoint)
+  --voxel_mode fast          # pcl (default), fast (VoxelMapFirstPoint), or none
 ```
 
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--params` | *(required)* | Path to YAML parameter file |
+| `--kitti_root` | *(required)* | KITTI odometry dataset root |
+| `--sequence` | `00` | KITTI sequence number |
+| `--start` | `0` | First frame index |
+| `--count` | `10` | Number of frames to process |
+| `--traj_file` | | Output trajectory file (KITTI 12-float format) |
+| `--voxel_mode` | `pcl` | `pcl`, `fast` (VoxelMapFirstPoint), or `none` (skip voxel) |
+| `--random_downsample` | `0` (off) | Randomly subsample to N points (applied after voxel, or alone if `--voxel_mode none`) |
+| `--max_iter` | `10000` | Override max GN iterations from YAML |
+| `--visualize` | off | Live point-cloud viewer (requires `-DGCVO_BUILD_VIZ=ON`) |
+
+For real-time computation, combine voxel + random downsampling with a tight iteration cap:
+```bash
+./build/gcvo_kitti_f2f \
+  --params gcvo_params/gcvo_driving_nonisotropic_gn.yaml \
+  --kitti_root /path/to/kitti/dataset \
+  --sequence 09 --start 0 --count 10000 \
+  --traj_file kitti_09.txt \
+  --voxel_mode fast \
+  --random_downsample 4000 \
+  --max_iter 40
+```
 
 ## Repository layout
 ```
