@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # GCVO PROVENANCE NOTICE (derived from RKHS_BA, MIT license)
 # Portions of this file are derived from RKHS_BA (MIT): https://github.com/UMich-CURLY/RKHS_BA
 # Upstream is included in this repo as a git submodule at: rkhs_ba/
@@ -14,31 +13,16 @@
 # License: RKHS_BA is MIT-licensed (see rkhs_ba/ for the upstream LICENSE). This repo’s license is in
 # the root LICENSE file. Contact (GCVO modifications): ray.zhang@tri.global
 
-set -euo pipefail
+cmake_minimum_required(VERSION 3.18)
+project(gcvo_external_example LANGUAGES CXX CUDA)
 
-# Example runner for gcvo_kitti_f2f
-#
-# Usage:
-#   ./scripts/run_kitti_f2f.sh <build_dir> <params.yaml> <kitti_root> [sequence] [start] [count]
-cd build_renamed
-make -j
-cd ..
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
 
-BUILD_DIR="./build_renamed/"
-PARAMS="gcvo_params/gcvo_driving_nonisotropic_gn.yaml"
-KITTI_ROOT="/home/`whoami`/code/docker_home/cvo/data/kitti/dataset/"
-SEQ="09"
-START="0"
-COUNT="100000"
+find_package(gcvo REQUIRED)
 
-for SEQ in 06 08
-do
-"${BUILD_DIR}/gcvo_kitti_f2f" \
-  --params "${PARAMS}" \
-  --kitti_root "${KITTI_ROOT}" \
-  --sequence "${SEQ}" \
-  --start "${START}" \
-  --count "${COUNT}" \
-  --voxel_mode fast \
-  --traj_file gcvo.${SEQ}.connection.kitti 
-done
+add_executable(register_clouds main.cu)
+target_link_libraries(register_clouds PRIVATE gcvo::gcvo_s1)
+target_compile_options(register_clouds PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)

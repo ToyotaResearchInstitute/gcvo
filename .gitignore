@@ -1,0 +1,51 @@
+# editor 
+*~
+*#
+
+# CUDA Compiler Output
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+
+# C++ and Compilation Output
+*.d
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+*.so
+*.dylib
+*.dll
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables and Build Artifacts
+*.exe
+*.out
+*.app
+[Dd]ebug/
+[Rr]elease/
+build/
+bin/
+obj/
+
+# Project/IDE specific files (Visual Studio, VS Code, CMake)
+.idea/
+.vscode/
+*.cache
+*.suo
+*.user
+*.config
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+CmakeFiles/
+compile_commands.json
