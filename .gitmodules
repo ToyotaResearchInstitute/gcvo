@@ -1,0 +1,3 @@
+[submodule "rkhs_ba"]
+	path = rkhs_ba
+	url = https://github.com/UMich-CURLY/RKHS_BA

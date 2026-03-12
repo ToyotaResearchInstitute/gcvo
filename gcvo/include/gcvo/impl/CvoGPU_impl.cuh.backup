@@ -1,0 +1,1109 @@
+#pragma once
+
+// Template implementations for gcvo::CvoGPU<PointT, KdTreeKMax>
+//
+// This file must be compiled with NVCC (it contains CUDA kernels).
+//
+// NOTE (March 2026): GCVO currently implements **only** the legacy second-order
+// (Gauss-Newton) update path. Legacy first-order knobs in CvoParams such as
+// `dl`, `dl_step`, and `step` are intentionally ignored here.
+
+#include "gcvo/CvoGPU.hpp"
+
+#include "gcvo/CvoState.cuh"
+#include "gcvo/SparseKernelMat.hpp"
+#include "gcvo/LieGroup.hpp"
+
+#include "cupointcloud/cupointcloud.h"
+#include "cukdtree/cukdtree.h"
+
+#include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/reduce.h>
+#include <thrust/transform.h>
+#include <thrust/execution_policy.h>
+#include <thrust/sort.h>                                                                                                                                             
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <queue>
+#include <type_traits>
+#include <utility>
+#include <algorithm>
+#include <cmath>
+
+#include <cuda_profiler_api.h>
+
+#ifndef GCVO_CUDA_THREADS
+#define GCVO_CUDA_THREADS 256
+#endif
+
+namespace gcvo {
+
+// -----------------------------
+// CUDA error helper
+// -----------------------------
+inline void gcvo_gpu_assert(cudaError_t code, const char* file, int line, bool abort = true) {
+  if (code != cudaSuccess) {
+    fprintf(stderr, "GCVO GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+    if (abort) std::exit(static_cast<int>(code));
+  }
+}
+
+#define GCVO_GPU_CHECK(ans) ::gcvo::gcvo_gpu_assert((ans), __FILE__, __LINE__)
+
+// -----------------------------
+// Small math helpers
+// -----------------------------
+__host__ __device__ inline Eigen::Matrix3f skew3(const Eigen::Vector3f& v) {
+  Eigen::Matrix3f m;
+  m << 0.0f, -v.z(), v.y(),
+       v.z(), 0.0f, -v.x(),
+      -v.y(), v.x(), 0.0f;
+  return m;
+}
+
+inline Eigen::Matrix4f exp_se3(const Eigen::Matrix<float, 6, 1>& xi) {
+  const Eigen::Vector3f w = xi.head<3>();
+  const Eigen::Vector3f v = xi.tail<3>();
+
+  const float theta = w.norm();
+  const Eigen::Matrix3f W = skew3(w);
+  const Eigen::Matrix3f W2 = W * W;
+
+  Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+  Eigen::Matrix3f V = Eigen::Matrix3f::Identity();
+
+  if (theta < 1e-6f) {
+    // Series expansions
+    R = Eigen::Matrix3f::Identity() + W + 0.5f * W2;
+    V = Eigen::Matrix3f::Identity() + 0.5f * W + (1.0f / 6.0f) * W2;
+  } else {
+    const float s = std::sin(theta);
+    const float c = std::cos(theta);
+    const float theta2 = theta * theta;
+    const float theta3 = theta2 * theta;
+
+    R = Eigen::Matrix3f::Identity() + (s / theta) * W + ((1.0f - c) / theta2) * W2;
+    V = Eigen::Matrix3f::Identity() + ((1.0f - c) / theta2) * W + ((theta - s) / theta3) * W2;
+  }
+
+  Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
+  T.block<3, 3>(0, 0) = R;
+  T.block<3, 1>(0, 3) = V * v;
+  return T;
+}
+
+template <int N>
+__host__ __device__ inline float squared_dist_arr(const float* a, const float* b) {
+  float s = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    const float d = a[i] - b[i];
+    s += d * d;
+  }
+  return s;
+}
+
+template <typename PointT>
+__host__ __device__ inline float squared_dist_xyz(const PointT& a, const PointT& b) {
+  const float dx = a.x - b.x;
+  const float dy = a.y - b.y;
+  const float dz = a.z - b.z;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+__device__ __forceinline__ Eigen::Matrix3f cov_sum_inv_plus_ell2I(const float* cov_a,
+                                                                  const float* cov_b,
+                                                                  float ell2) {
+  // Legacy layout: covariance arrays are stored in **column-major** order.
+  using Mat33CM = Eigen::Matrix<float, 3, 3, Eigen::ColMajor>;
+  Eigen::Matrix3f cov = Eigen::Map<const Mat33CM>(cov_a) + Eigen::Map<const Mat33CM>(cov_b);
+  cov(0, 0) += ell2;
+  cov(1, 1) += ell2;
+  cov(2, 2) += ell2;
+  return cov.inverse();
+}
+
+// -----------------------------
+// Point transform (thrust)
+// -----------------------------
+namespace cuda_detail {
+
+template <typename PointT>
+struct TransformPointRT {
+  const Eigen::Matrix3f* R;
+  const Eigen::Vector3f* t;
+  const bool update_normal_and_cov;
+
+  __host__ __device__ TransformPointRT(const Eigen::Matrix3f* R_, const Eigen::Vector3f* t_,
+                                      bool update_) : R(R_), t(t_), update_normal_and_cov(update_) {}
+
+  __host__ __device__ PointT operator()(const PointT& p_in) const {
+    PointT p_out(p_in);
+
+    Eigen::Vector3f x(p_in.x, p_in.y, p_in.z);
+    Eigen::Vector3f x_t = (*R) * x + (*t);
+    p_out.x = x_t.x();
+    p_out.y = x_t.y();
+    p_out.z = x_t.z();
+
+    if (update_normal_and_cov) {
+      if constexpr (gcvo::detail::has_normal<PointT>::value) {
+        Eigen::Vector3f n(p_in.normal[0], p_in.normal[1], p_in.normal[2]);
+        Eigen::Vector3f n_t = (*R) * n;  // rotation only
+        p_out.normal[0] = n_t.x();
+        p_out.normal[1] = n_t.y();
+        p_out.normal[2] = n_t.z();
+      }
+      if constexpr (gcvo::detail::has_covariance<PointT>::value) {
+        Eigen::Matrix3f C;
+        C << p_in.covariance[0], p_in.covariance[1], p_in.covariance[2],
+             p_in.covariance[3], p_in.covariance[4], p_in.covariance[5],
+             p_in.covariance[6], p_in.covariance[7], p_in.covariance[8];
+        Eigen::Matrix3f C_t = (*R) * C * R->transpose();
+        #pragma unroll
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            p_out.covariance[r * 3 + c] = C_t(r, c);
+      }
+    }
+    return p_out;
+  }
+};
+
+template <typename PointT>
+inline void transform_pointcloud_thrust(const std::shared_ptr<CuPointCloud<PointT>>& in,
+                                        const std::shared_ptr<CuPointCloud<PointT>>& out,
+                                        const Eigen::Matrix3f* R_gpu,
+                                        const Eigen::Vector3f* t_gpu,
+                                        bool update_normal_and_cov) {
+  thrust::transform(in->points.begin(), in->points.end(), out->points.begin(),
+                   TransformPointRT<PointT>(R_gpu, t_gpu, update_normal_and_cov));
+}
+
+}  // namespace cuda_detail
+
+// -----------------------------
+// A-matrix kernels
+// -----------------------------
+
+__device__ __forceinline__ float geometric_type_similarity(const float* a, const float* b) {
+  // Similarity in [0,1], using squared cosine similarity.
+  const float dot = a[0] * b[0] + a[1] * b[1];
+  const float na2 = a[0] * a[0] + a[1] * a[1];
+  const float nb2 = b[0] * b[0] + b[1] * b[1];
+  const float denom = na2 * nb2;
+  if (denom < 1e-12f) return 0.0f;
+  const float c = dot * dot / denom;
+  return c;
+}
+
+template <typename PointT>
+__global__ void fill_in_A_mat_cukdtree_kernel(const CvoParams* params,
+                                              const PointT* src_tf,
+                                              int n_src,
+                                              const PointT* tgt,
+                                              int n_tgt,
+                                              const int* nn_inds,
+                                              int k,
+                                              float ell,
+                                              // output
+                                              SparseKernelMat* A) {
+  constexpr int FD = static_cast<int>(PointT::FEATURE_DIMENSION);
+  constexpr int NC = static_cast<int>(PointT::LABEL_DIMENSION);
+
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_src) return;
+
+  const float sigma2 = params->sigma * params->sigma;
+  const float c_ell2 = params->c_ell * params->c_ell;
+  const float c_sigma2 = params->c_sigma * params->c_sigma;
+  const float s_ell2 = params->s_ell * params->s_ell;
+  const float s_sigma2 = params->s_sigma * params->s_sigma;
+  const float sp_thres = params->sp_thres;
+
+  unsigned int nn_count = 0;
+  const PointT& p = src_tf[i];
+  const float ell2 = ell * ell;
+
+  for (int j = 0; j < k; ++j) {
+    const int idx = nn_inds[i * k + j];
+    if (idx < 0 || idx >= n_tgt) break;
+    const PointT& q = tgt[idx];
+
+    float geo_sim = 1.0f;
+    if (params->is_using_geometric_type) {
+      geo_sim = geometric_type_similarity(p.geometric_type, q.geometric_type);
+      if (geo_sim < 1e-3f) continue;
+    }
+
+    float k_geo = 1.0f;
+    if (params->is_using_geometry) {
+      if (params->kernel_type == CvoKernelType::SCALAR) {
+        const float d2 = squared_dist_xyz(p, q);
+        if (d2 > params->kernel_eval_max_dist) continue;
+        k_geo = sigma2 * expf(-d2 / (2.0f * ell2));
+      } else {
+        // Dense/rescaled kernel uses covariances.
+        const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_ell2I(p.covariance, q.covariance, ell2);
+        Eigen::Vector3f dp(p.x - q.x, p.y - q.y, p.z - q.z);
+        const float d2 = dp.dot(cov_inv * dp);
+        if (!isfinite(d2) || d2 > params->kernel_eval_max_dist) continue;
+        k_geo = sigma2 * expf(-0.5f * d2);
+      }
+    }
+
+    float k_feat = 1.0f;
+    if (params->is_using_intensity) {
+      const float d2 = squared_dist_arr<FD>(p.features, q.features);
+      k_feat = c_sigma2 * expf(-d2 / (2.0f * c_ell2));
+    }
+
+    float k_sem = 1.0f;
+    if (params->is_using_semantics) {
+      const float d2 = squared_dist_arr<NC>(p.label_distribution, q.label_distribution);
+      k_sem = s_sigma2 * expf(-d2 / (2.0f * s_ell2));
+    }
+
+    const float a_ij = k_geo * k_feat * k_sem * geo_sim;
+    if (a_ij > sp_thres) {
+      A->mat[i * A->cols + nn_count] = a_ij;
+      A->ind_row2col[i * A->cols + nn_count] = idx;
+      nn_count++;
+      if (nn_count >= static_cast<unsigned int>(k)) break;
+    }
+  }
+
+  A->nonzeros[i] = nn_count;
+}
+
+__device__ __forceinline__
+float exp_d2_thresh_scalar(float k_min, float k_sigma2, float two_ell2) {
+  // For kernels of form: k = k_sigma2 * exp(-d2 / two_ell2)
+  // Return d2 threshold such that k >= k_min  <=>  d2 <= thresh.
+  if (k_min <= 0.0f) return 1e30f;     // no pruning
+  if (k_min >= k_sigma2) return 0.0f;  // only d2==0 can pass
+  const float ratio = fmaxf(k_min / k_sigma2, 1e-30f);
+  return -two_ell2 * logf(ratio);
+}
+  
+template <typename PointT>
+__global__ void fill_in_A_mat_bruteforce_kernel(const CvoParams* params,
+                                                const PointT* src_tf,
+                                                int n_src,
+                                                const PointT* tgt,
+                                                int n_tgt,
+                                                int k,
+                                                float ell,
+                                                // output
+                                                SparseKernelMat* A) {
+  constexpr int FD = static_cast<int>(PointT::FEATURE_DIMENSION);
+  constexpr int NC = static_cast<int>(PointT::LABEL_DIMENSION);
+
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_src) return;
+
+  const float sigma2 = params->sigma * params->sigma;
+  const float c_ell2 = params->c_ell * params->c_ell;
+  const float c_sigma2 = params->c_sigma * params->c_sigma;
+  const float s_ell2 = params->s_ell * params->s_ell;
+  const float s_sigma2 = params->s_sigma * params->s_sigma;
+  const float sp_thres = params->sp_thres;
+
+  unsigned int nn_count = 0;
+  const PointT& p = src_tf[i];
+  const float ell2 = ell * ell;
+
+  // ---- Precompute safe minima for each factor (upper-bound pruning) ----
+  const float max_geo  = (params->is_using_geometry)  ? sigma2    : 1.0f;
+  const float max_feat = (params->is_using_intensity) ? c_sigma2  : 1.0f;
+  const float max_sem  = (params->is_using_semantics) ? s_sigma2  : 1.0f;
+
+  // Minimum each factor must exceed to ever get a_ij > sp_thres,
+  // assuming the other enabled factors are at their maximum.
+  const float kgeo_min  = (params->is_using_geometry)  ? (sp_thres / (max_feat * max_sem)) : 0.0f;
+  const float kfeat_min = (params->is_using_intensity) ? (sp_thres / (max_geo  * max_sem)) : 0.0f;
+  const float ksem_min  = (params->is_using_semantics) ? (sp_thres / (max_geo  * max_feat)) : 0.0f;
+
+  // Convert those into distance thresholds for exp kernels.
+  // If min >= sigma^2, nothing passes except possibly exact d2=0 (threshold 0).
+
+  const float d2_geo_thres_scalar = (params->is_using_geometry && params->kernel_type == CvoKernelType::SCALAR)
+    ? fminf(params->kernel_eval_max_dist,
+            exp_d2_thresh_scalar(kgeo_min, sigma2, 2.0f * ell2))
+    : params->kernel_eval_max_dist;
+
+  // intensity: k_feat = c_sigma2 * exp(-d2/(2*c_ell2))
+  const float d2_feat_thres = (params->is_using_intensity)
+    ? exp_d2_thresh_scalar(kfeat_min, c_sigma2, 2.0f * c_ell2)
+    : 1e30f;
+
+  // semantics: k_sem = s_sigma2 * exp(-d2/(2*s_ell2))
+  const float d2_sem_thres = (params->is_using_semantics)
+    ? exp_d2_thresh_scalar(ksem_min, s_sigma2, 2.0f * s_ell2)
+    : 1e30f;
+
+  // ---- Main brute-force scan ----
+  for (int idx = 0; idx < n_tgt && nn_count < static_cast<unsigned int>(k); ++idx) {
+    const PointT& q = tgt[idx];
+
+    float geo_sim = 1.0f;
+    if (params->is_using_geometric_type) {
+      geo_sim = geometric_type_similarity(p.geometric_type, q.geometric_type);
+      if (geo_sim < 1e-3f) continue;
+    }
+
+    // Intensity (safe prune before exp)
+    float k_feat = 1.0f;
+    if (params->is_using_intensity) {
+      const float d2c = squared_dist_arr<FD>(p.features, q.features);
+      if (d2c > d2_feat_thres) continue; // cannot reach sp_thres even with max_geo*max_sem
+      k_feat = c_sigma2 * __expf(-d2c / (2.0f * c_ell2));
+    }
+
+    // Semantics (safe prune before exp)
+    float k_sem = 1.0f;
+    if (params->is_using_semantics) {
+      const float d2s = squared_dist_arr<NC>(p.label_distribution, q.label_distribution);
+      if (d2s > d2_sem_thres) continue;
+      k_sem = s_sigma2 * __expf(-d2s / (2.0f * s_ell2));
+    }
+
+    // Geometry
+    float k_geo = 1.0f;
+    if (params->is_using_geometry) {
+      if (params->kernel_type == CvoKernelType::SCALAR) {
+        const float d2 = squared_dist_xyz(p, q);
+        if (d2 > d2_geo_thres_scalar) continue;           // includes kernel_eval_max_dist + safe prune
+        k_geo = sigma2 * __expf(-d2 / (2.0f * ell2));
+      } else {
+        // Dense/rescaled: can still prune *after* d2 is computed using a safe kgeo_min bound.
+        const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_ell2I(p.covariance, q.covariance, ell2);
+        Eigen::Vector3f dp(p.x - q.x, p.y - q.y, p.z - q.z);
+        const float d2 = dp.dot(cov_inv * dp);
+        if (!isfinite(d2) || d2 > params->kernel_eval_max_dist) continue;
+
+        // Safe prune for dense: k_geo = sigma2 * exp(-0.5*d2) must exceed kgeo_min
+        if (kgeo_min > 0.0f && kgeo_min < sigma2) {
+          const float d2_need = -2.0f * logf(fmaxf(kgeo_min / sigma2, 1e-30f));
+          if (d2 > d2_need) continue;
+        } else if (kgeo_min >= sigma2) {
+          continue;
+        }
+
+        k_geo = sigma2 * __expf(-0.5f * d2);
+      }
+    }
+
+    const float a_ij = k_geo * k_feat * k_sem * geo_sim;
+    if (a_ij > sp_thres) {
+      A->mat[i * A->cols + nn_count] = a_ij;
+      A->ind_row2col[i * A->cols + nn_count] = idx;
+      ++nn_count;
+    }
+  }
+
+  A->nonzeros[i] = nn_count;
+}
+
+// -----------------------------
+// GN Hessian kernel (LEGACY CvoGPU.cu math)
+//   - fixed/moving roles match legacy implementation
+//   - residual r = x - y (x=fixed, y=moving transformed into fixed frame)
+//   - Jacobian J = [ -skew(y)  I ]
+//   - optional full-hessian term (params->is_full_hessian)
+// -----------------------------
+
+template <typename PointT>
+__global__ void compute_hessian_gn_kernel(const CvoParams* params,
+                                          const PointT* fixed,      // fixed points (cloud_x)
+                                          const PointT* moving_tf,  // moving points in fixed frame (cloud_y transformed)
+                                          const SparseKernelMat* A,
+                                          int num_neighbors,
+                                          float ell,
+                                          // outputs
+                                          Eigen::Matrix<float, 6, 6, Eigen::RowMajor>* H_i,
+                                          Eigen::Matrix<float, 6, 1>* g_i) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= A->rows) return;
+
+  Eigen::Matrix<float, 6, 6, Eigen::RowMajor> Hi = Eigen::Matrix<float, 6, 6, Eigen::RowMajor>::Zero();
+  Eigen::Matrix<float, 6, 1> gi = Eigen::Matrix<float, 6, 1>::Zero();
+
+  const PointT& px = fixed[i];
+  const Eigen::Vector3f x(px.x, px.y, px.z);
+
+  const float ell2 = ell * ell;
+  const bool use_dense = (params->kernel_type != CvoKernelType::SCALAR);
+  const float l2_inv = 1.0f / ell2;
+
+  // Legacy CvoGPU.cu uses `num_neighbors` as the stride for A (even though A->cols == num_neighbors).
+  for (int j = 0; j < num_neighbors; ++j) {
+    const int idx = A->ind_row2col[i * num_neighbors + j];
+    if (idx < 0) break;
+    const float a_ij = A->mat[i * num_neighbors + j];
+    const PointT& py = moving_tf[idx];
+    const Eigen::Vector3f y(py.x, py.y, py.z);
+
+    // Residual (legacy): r = x - y
+    const Eigen::Vector3f r = x - y;
+
+    // Jacobian (legacy): J = [ -skew(y), I ]
+    const Eigen::Matrix3f skew_y = skew3(y);
+    Eigen::Matrix<float, 3, 6> J;
+    J.block<3, 3>(0, 0) = -skew_y;
+    J.block<3, 3>(0, 3) = Eigen::Matrix3f::Identity();
+
+    if (!use_dense) {
+      const float w = l2_inv;
+      const Eigen::Matrix<float, 6, 6, Eigen::RowMajor> hij = a_ij * (J.transpose() * w * J);
+      const Eigen::Matrix<float, 6, 1> jr = a_ij * (J.transpose() * w * r);
+      Hi.noalias() += hij;
+      gi.noalias() += jr;
+      if (params->is_full_hessian) {
+        Hi.noalias() += (J.transpose() * w * r) * (jr.transpose());
+      }
+    } else {
+      const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_ell2I(px.covariance, py.covariance, ell2);
+      const Eigen::Matrix<float, 6, 6, Eigen::RowMajor> hij = a_ij * (J.transpose() * cov_inv * J);
+      const Eigen::Matrix<float, 6, 1> jr = a_ij * (J.transpose() * cov_inv * r);
+      Hi.noalias() += hij;
+      gi.noalias() += jr;
+      if (params->is_full_hessian) {
+        Hi.noalias() += (J.transpose() * cov_inv * r) * (jr.transpose());
+      }
+    }
+  }
+
+  H_i[i] = Hi;
+  g_i[i] = gi;
+}
+
+// -----------------------------
+// Association extraction
+// -----------------------------
+inline void gpu_association_to_cpu(const SparseKernelMat& A_devptrs,
+                                   Association& assoc,
+                                   int num_rows,
+                                   int num_cols,
+                                   int num_neighbors) {
+  const int rows = num_rows;
+  const int cols = num_neighbors;
+  if (rows <= 0 || cols <= 0) return;
+  if (A_devptrs.nonzero_sum == 0) return;
+
+  const int stride = A_devptrs.cols;
+
+  thrust::device_ptr<float> w_ptr = thrust::device_pointer_cast(A_devptrs.mat);
+  thrust::device_ptr<int> ind_ptr = thrust::device_pointer_cast(A_devptrs.ind_row2col);
+  thrust::device_ptr<unsigned int> nn_ptr = thrust::device_pointer_cast(A_devptrs.nonzeros);
+
+  // Copy full-stride buffers; we'll only read the first `cols` entries per row.
+  thrust::host_vector<float> w_host(w_ptr, w_ptr + rows * stride);
+  thrust::host_vector<int> ind_host(ind_ptr, ind_ptr + rows * stride);
+  thrust::host_vector<unsigned int> nn_host(nn_ptr, nn_ptr + rows);
+
+  assoc.pairs.resize(rows, num_cols);
+  assoc.source_inliers.clear();
+  assoc.target_inliers.clear();
+
+  for (int i = 0; i < rows; ++i) {
+    if (nn_host[i] == 0) continue;
+    assoc.source_inliers.push_back(i);
+    for (int j = 0; j < cols; ++j) {
+      const int idx = ind_host[i * stride + j];
+      if (idx < 0) break;
+      assoc.target_inliers.push_back(idx);
+      assoc.pairs.insert(i, idx) = w_host[i * stride + j];
+    }
+  }
+  assoc.pairs.makeCompressed();
+}
+
+// -----------------------------
+// Ell decay indicator (ported, simplified)
+// -----------------------------
+// EMA-based ell decay trigger.
+// - Maintains an exponential moving average (EMA) of `indicator`.
+// - Uses the SAME "ratio within [1±threshold]" criterion, but on EMA windows.
+// - Optional cooldown to prevent repeated decays in consecutive iterations.
+//
+// Usage pattern (inside align loop):
+//   static float ema = 0.0f;
+//   static bool ema_init = false;
+//   static int cooldown = 0;
+//   if (should_decay_ell_ema(ema, ema_init, cooldown, ip_indicator, params_)) { ...decay ell... }
+//
+// Notes:
+// - alpha in (0,1], typical 0.1~0.3
+// - min_indicator avoids divide-by-tiny / noise when A_sum is small.
+static inline bool should_decay_ell_ema(
+    float& ema,                 // state: EMA value
+    bool& ema_initialized,       // state: init flag
+    int& cooldown_iters_left,    // state: cooldown counter
+    float indicator,             // input: raw indicator (e.g., A_sum)
+    const CvoParams& params,
+    // knobs (can be constants if you prefer)
+    float alpha = 0.2f,          // EMA smoothing factor
+    float min_indicator = 1e-6f, // gate tiny values
+    int cooldown_iters = 0       // 0 disables cooldown
+) {
+  // Step 0: cooldown handling
+  if (cooldown_iters_left > 0) {
+    cooldown_iters_left--;
+  }
+
+  // Step 1: update EMA
+  if (!ema_initialized) {
+    ema = indicator;
+    ema_initialized = true;
+  } else {
+    ema = (1.0f - alpha) * ema + alpha * indicator;
+  }
+
+  // Step 2: we still want the "start vs end" window behavior,
+  // but instead of storing queues, we can emulate it with two EMA accumulators:
+  //   - a slow EMA ("start") and a fast EMA ("end")
+  //
+  // To stay close to your original window size, we derive rates from win:
+  const int win = std::max(1, params.indicator_window_size);
+
+  // Convert window length to EMA rates.
+  // This mapping keeps "effective memory" roughly proportional to win.
+  const float a_fast = std::min(1.0f, 2.0f / float(win + 1));        // fast reacts in ~win iters
+  const float a_slow = std::min(1.0f, 2.0f / float(2 * win + 1));    // slow reacts in ~2*win iters
+
+  // Persisted internal state (per translation unit). If you want per-instance,
+  // move these into your state/align scope instead.
+  static float start_ema = 0.0f;
+  static float end_ema   = 0.0f;
+  static bool  inited    = false;
+
+  if (!inited) {
+    start_ema = ema;
+    end_ema   = ema;
+    inited    = true;
+    return false;
+  }
+
+  // Update the two EMAs using the already-smoothed ema.
+  start_ema = (1.0f - a_slow) * start_ema + a_slow * ema;
+  end_ema   = (1.0f - a_fast) * end_ema   + a_fast * ema;
+
+  // Step 3: decide decay using same ratio band test
+  if (cooldown_iters_left > 0) return false;
+
+  const float denom = std::max(std::fabs(start_ema), min_indicator);
+  const float ratio = end_ema / denom;
+
+  const float lo = 1.0f - params.indicator_stable_threshold;
+  const float hi = 1.0f + params.indicator_stable_threshold;
+
+  if (ratio > lo && ratio < hi) {
+    if (cooldown_iters > 0) cooldown_iters_left = cooldown_iters;
+    return true;
+  }
+  return false;
+}
+  
+static inline bool should_decay_ell(std::queue<float>& start_q,
+                                   std::queue<float>& end_q,
+                                   float& start_sum,
+                                   float& end_sum,
+                                   float indicator,
+                                   const CvoParams& params) {
+  const int win = params.indicator_window_size;
+  bool decay = false;
+
+  if (static_cast<int>(start_q.size()) < win) {
+    start_q.push(indicator);
+    start_sum += indicator;
+    return false;
+  }
+  if (static_cast<int>(end_q.size()) < win) {
+    end_q.push(indicator);
+    end_sum += indicator;
+  }
+
+  if (static_cast<int>(end_q.size()) >= win) {
+    const float ratio = (start_sum > 1e-12f) ? (end_sum / start_sum) : 1.0f;
+    const float lo = 1.0f - params.indicator_stable_threshold;
+    const float hi = 1.0f + params.indicator_stable_threshold;
+    if (ratio > lo && ratio < hi) {
+      decay = true;
+      std::queue<float> empty;
+      std::swap(start_q, empty);
+      std::queue<float> empty2;
+      std::swap(end_q, empty2);
+      start_sum = 0.0f;
+      end_sum = 0.0f;
+    } else {
+      // slide window
+      end_sum -= end_q.front();
+      start_sum += end_q.front();
+      start_q.push(end_q.front());
+      end_q.pop();
+      start_sum -= start_q.front();
+      start_q.pop();
+
+      end_q.push(indicator);
+      end_sum += indicator;
+    }
+  }
+  return decay;
+}
+
+// -----------------------------
+// PointCloud -> GPU helper
+// -----------------------------
+template <typename PointT>
+static std::shared_ptr<CuPointCloud<PointT>> pointcloud_to_gpu(const CvoPointCloudT<PointT>& cloud) {
+  using GpuCloud = CuPointCloud<PointT>;
+  typename GpuCloud::HostVectorType host(cloud.points().begin(), cloud.points().end());
+  auto gpu_cloud = std::make_shared<GpuCloud>();
+  gpu_cloud->points = host;
+  return gpu_cloud;
+}
+
+// -----------------------------
+// CvoGPU methods
+// -----------------------------
+
+template <typename PointT, int KdTreeKMax>
+CvoGPU<PointT, KdTreeKMax>::CvoGPU(const std::string& yaml_param_file) {
+  read_CvoParams_yaml(yaml_param_file.c_str(), &params_);
+  GCVO_GPU_CHECK(cudaMalloc((void**)&params_gpu_, sizeof(CvoParams)));
+  GCVO_GPU_CHECK(cudaMemcpy(params_gpu_, &params_, sizeof(CvoParams), cudaMemcpyHostToDevice));
+}
+
+template <typename PointT, int KdTreeKMax>
+CvoGPU<PointT, KdTreeKMax>::CvoGPU(const CvoParams& params) : params_(params) {
+  GCVO_GPU_CHECK(cudaMalloc((void**)&params_gpu_, sizeof(CvoParams)));
+  GCVO_GPU_CHECK(cudaMemcpy(params_gpu_, &params_, sizeof(CvoParams), cudaMemcpyHostToDevice));
+}
+
+template <typename PointT, int KdTreeKMax>
+CvoGPU<PointT, KdTreeKMax>::~CvoGPU() {
+  if (params_gpu_) cudaFree(params_gpu_);
+  params_gpu_ = nullptr;
+}
+
+template <typename PointT, int KdTreeKMax>
+void CvoGPU<PointT, KdTreeKMax>::write_params(const CvoParams& p_cpu) {
+  params_ = p_cpu;
+  GCVO_GPU_CHECK(cudaMemcpy(params_gpu_, &params_, sizeof(CvoParams), cudaMemcpyHostToDevice));
+}
+
+template <typename PointT, int KdTreeKMax>
+static Eigen::Matrix<float, 6, 1> compute_gn_update(const CvoParams& params_cpu,
+                                                    const CvoParams* params_gpu,
+                                                    CvoStateT<PointT, KdTreeKMax>& state,
+                                                    int num_neighbors,
+                                                    // optional debug outputs
+                                                    typename CvoStateT<PointT, KdTreeKMax>::Mat66* H_out = nullptr,
+                                                    typename CvoStateT<PointT, KdTreeKMax>::Vec6* g_out = nullptr) {
+  using Mat66 = typename CvoStateT<PointT, KdTreeKMax>::Mat66;
+  using Vec6  = typename CvoStateT<PointT, KdTreeKMax>::Vec6;
+
+  const int threads = GCVO_CUDA_THREADS;
+  const int blocks = (state.num_fixed + threads - 1) / threads;
+
+  compute_hessian_gn_kernel<PointT><<<blocks, threads>>>(
+      params_gpu,
+      thrust::raw_pointer_cast(state.cloud_fixed->points.data()),
+      thrust::raw_pointer_cast(state.cloud_moving_tf->points.data()),
+      state.A,
+      num_neighbors,
+      state.ell,
+      thrust::raw_pointer_cast(state.H_rows.data()),
+      thrust::raw_pointer_cast(state.g_rows.data()));
+  //GCVO_GPU_CHECK(cudaDeviceSynchronize());
+  GCVO_GPU_CHECK(cudaGetLastError());
+
+  const Mat66 H0 = Mat66::Zero();
+  const Vec6 g0 = Vec6::Zero();
+  const Mat66 H = thrust::reduce(thrust::device, state.H_rows.begin(), state.H_rows.end(), H0);
+  const Vec6 g = thrust::reduce(thrust::device, state.g_rows.begin(), state.g_rows.end(), g0);
+
+  if (H_out) *H_out = H;
+  if (g_out) *g_out = g;
+
+  // Legacy GN solve: dx = -H^{-1} Jr
+  const Mat66 Hsym = 0.5f * (H + H.transpose());
+  Eigen::LDLT<Mat66> ldlt(Hsym);
+  Vec6 dx = -ldlt.solve(g);
+  if (!dx.array().isFinite().all()) {
+    dx.setZero();
+  }
+  return dx;
+}
+
+// Optional legacy behavior: per-row sorting of A by weight (descending).
+// The legacy CUDA kernels perform a sort when `multiframe_is_sorting_inner_product` is enabled.
+// For the templated rewrite, we replicate this on the host using Thrust.
+template <typename PointT, int KdTreeKMax>
+static inline void sort_A_rows_if_enabled(const CvoParams& params,
+                                          CvoStateT<PointT, KdTreeKMax>& state,
+                                          int k) {
+  if (params.multiframe_is_sorting_inner_product <= 0) return;
+  const unsigned int thresh = static_cast<unsigned int>(params.multiframe_is_sorting_inner_product);
+
+  // Pull per-row nnz to host (small)
+  thrust::device_ptr<unsigned int> nn_ptr = thrust::device_pointer_cast(state.A_host.nonzeros);
+  thrust::host_vector<unsigned int> nn_host(nn_ptr, nn_ptr + state.num_fixed);
+
+  float* w = state.A_host.mat;
+  int* ind = state.A_host.ind_row2col;
+
+  for (int i = 0; i < state.num_fixed; ++i) {
+    const unsigned int nnz = nn_host[i];
+    if (nnz <= thresh) continue;
+    const int row_off = i * k;
+    thrust::sort_by_key(thrust::device,
+                        thrust::device_pointer_cast(w + row_off),
+                        thrust::device_pointer_cast(w + row_off + static_cast<int>(nnz)),
+                        thrust::device_pointer_cast(ind + row_off),
+                        thrust::greater<float>());
+  }
+}
+
+template <typename PointT, int KdTreeKMax>
+int CvoGPU<PointT, KdTreeKMax>::align(const PointCloud& source,
+                          const PointCloud& target,
+                                      const Eigen::Matrix4f& T_s2t_init, /// h^{-1} in the paper
+                          Eigen::Matrix4f& T_s2t_out,
+                          Association* association,
+                          int* num_iters,
+                          double* registration_seconds) const {
+
+  cudaProfilerStart();
+  
+  if (source.size() == 0 || target.size() == 0) {
+    if (num_iters) *num_iters = 0;
+    if (registration_seconds) *registration_seconds = 0.0;
+    T_s2t_out = T_s2t_init;
+    return -1;
+  }
+
+  // Build GPU clouds
+  auto src_gpu = pointcloud_to_gpu<PointT>(source);
+  auto tgt_gpu = pointcloud_to_gpu<PointT>(target);
+
+  CvoStateT<PointT, KdTreeKMax> state(src_gpu, tgt_gpu, params_);
+
+  // Legacy first-order hyperparameters are not used in the GN path.
+  // Keep a loud hint when debug_print is enabled so config surprises are visible.
+  const bool dbg = (params_.debug_print != 0);  
+  if (params_.debug_print) {
+    if (params_.dl != 0.0 || params_.dl_step != 0.0 || params_.step != 0.0f) {
+      std::cout << "[gcvo][debug] NOTE: dl/dl_step/step are ignored (GCVO uses only Gauss-Newton).\n";
+    }
+  }
+
+  const int k_cap = state.use_kdtree
+                      ? std::min(KdTreeKMax, params_.nearest_neighbors_max)
+                      : params_.nearest_neighbors_max;
+  int k = std::max(1, k_cap);
+
+  // === Legacy CvoGPU.cu convention (matches old, extensively tested implementation) ===
+  // Public API provides T_s2t (target -> source):   p_s = T_s2t * p_t
+  // The legacy optimizer maintains (R,t) for the *inverse* transform T_t2s = inv(T_s2t)
+  // in the form:                                   p_t = R * p_s + t
+  // Each iteration transforms the *moving* cloud (target) into the *fixed* frame (source)
+  // using inv(T_t2s) = T_s2t = [R^T, -R^T t].
+  const Eigen::Matrix4f T_t2s_init = T_s2t_init.inverse();
+  Eigen::Matrix3f R = T_t2s_init.block<3, 3>(0, 0);
+  Eigen::Vector3f t = T_t2s_init.block<3, 1>(0, 3);
+
+  std::queue<float> ind_start, ind_end;
+  float ind_start_sum = 0.0f;
+  float ind_end_sum = 0.0f;
+  float ema = 0.0f;
+  bool ema_init = false;
+  int cooldown = params_.ell_decay_start;
+
+  double t_fill_mat = 0.0;
+  double t_grad = 0.0;
+  double t_hess = 0.0;
+
+  cudaEvent_t ev_start, ev_stop;
+  cudaEventCreate(&ev_start);
+  cudaEventCreate(&ev_stop);
+  cudaEventRecord(ev_start, 0);
+
+  int it = 0;
+  for (; it < params_.MAX_ITER; ++it) {
+    if (dbg)
+      std::cout<<"===========================\n";
+    state.reset_state_at_new_iter(k);
+
+    // Inverse transform for mapping moving->fixed.
+    const Eigen::Matrix3f R_inv = R.transpose();
+    const Eigen::Vector3f t_inv = -R_inv * t;
+    GCVO_GPU_CHECK(cudaMemcpy(state.R_gpu, &R_inv, sizeof(Eigen::Matrix3f), cudaMemcpyHostToDevice));
+    GCVO_GPU_CHECK(cudaMemcpy(state.t_gpu, &t_inv, sizeof(Eigen::Vector3f), cudaMemcpyHostToDevice));
+
+    // Transform moving cloud into fixed frame.
+    const bool update_normal_cov = (params_.kernel_type != CvoKernelType::SCALAR);
+    cuda_detail::transform_pointcloud_thrust<PointT>(state.cloud_moving_init, state.cloud_moving_tf,
+                                                     state.R_gpu, state.t_gpu, update_normal_cov);
+    //GCVO_GPU_CHECK(cudaDeviceSynchronize());
+    GCVO_GPU_CHECK(cudaGetLastError());
+
+    // Neighbors + A
+    const int threads = GCVO_CUDA_THREADS;
+    const int blocks = (state.num_fixed + threads - 1) / threads;
+
+    fill_in_A_mat_bruteforce_kernel<PointT><<<blocks, threads>>>(
+                                                                 params_gpu_,
+                                                                 thrust::raw_pointer_cast(state.cloud_fixed->points.data()), state.num_fixed,
+                                                                 thrust::raw_pointer_cast(state.cloud_moving_tf->points.data()), state.num_moving,
+                                                                 k,
+                                                                 state.ell,
+                                                                 state.A);
+    //GCVO_GPU_CHECK(cudaDeviceSynchronize());
+    GCVO_GPU_CHECK(cudaGetLastError());
+
+    compute_nonzeros(&state.A_host);
+    sort_A_rows_if_enabled(params_, state, k);
+    if (state.A_host.nonzero_sum < 100) {
+      // Too sparse: likely no overlap / bad init.
+      if (params_.debug_print) {
+        std::cout << "[gcvo][debug] it=" << it << " nonzeros=" << state.A_host.nonzero_sum << " -> break (too sparse)\n";
+      }
+      break;
+    }
+
+    // Second-order update (Gauss-Newton), matching legacy CvoGPU.cu math.
+    typename CvoStateT<PointT, KdTreeKMax>::Mat66 H_dbg;
+    typename CvoStateT<PointT, KdTreeKMax>::Vec6  g_dbg;
+
+
+    const Eigen::Matrix<float, 6, 1> dx = compute_gn_update<PointT, KdTreeKMax>(
+        params_, params_gpu_, state, k,
+        dbg ? &H_dbg : nullptr,
+        dbg ? &g_dbg : nullptr);
+
+    const float dx_norm = dx.norm();
+    if (params_.kernel_type == CvoKernelType::SCALAR) {
+      if (state.ell <= params_.ell_min && dx_norm < params_.eps_2) {
+        if (dbg) {
+          std::cout<<"[gcvo][debug] break, ell="<<state.ell<<", dx_norm="<<dx_norm<<"\n";
+        }
+        break;
+      }
+    } else {
+      if (dx_norm < params_.eps_2) {
+      //if (dist_this_iter < params_.eps_2) {
+        if (dbg) {
+          std::cout<<"[gcvo][debug] break, dx_norm="<<dx_norm<<"\n";
+        }
+        break;
+      }
+    }
+
+    const Eigen::Matrix<double, 6, 1> dx_d = dx.cast<double>();
+    const Eigen::Matrix<double, 3, 4, Eigen::RowMajor> dRt = gcvo::liegroup::Exp_SE3<double, Eigen::RowMajor>(dx_d, true);
+    const Eigen::Matrix3d dR = dRt.block<3, 3>(0, 0);
+    const Eigen::Vector3d dt = dRt.block<3, 1>(0, 3);
+
+    // RIGHT composition on T_s2t: R <- R*dR, t <- R*dt + t
+    const Eigen::Vector3f t_new = (R.cast<double>() * dt + t.cast<double>()).cast<float>();
+    const Eigen::Matrix3f R_new = (R.cast<double>() * dR).cast<float>();
+    t = t_new;
+    R = R_new;
+
+    const double dist_this_iter = gcvo::liegroup::dist_se3<double>(dR, dt);
+    float sum_of_A = thrust::reduce(thrust::device,
+                                    state.A_host.mat,
+                                    state.A_host.mat + state.A_host.rows * k, 0.0f);
+
+    if (dbg) {
+      const Eigen::Matrix3f R_new_dbg = R;
+      const Eigen::Vector3f t_new_dbg = t;
+      std::cout << "[gcvo][debug] it=" << it
+                << " k=" << k
+                << " ell=" << state.ell
+                << " nonzeros=" << state.A_host.nonzero_sum
+                << " dx_norm=" << dx_norm << "\n";
+      std::cout << "[gcvo][debug] A_sum = "<<A_sum(&state.A_host)<<"\n";
+      std::cout << "[gcvo][debug] dx^T = " << dx.transpose() << "\n";
+      std::cout << "[gcvo][debug] dT =\n" << dRt << "\n";
+      std::cout << "[gcvo][debug] g^T = " << g_dbg.transpose() << "\n";
+      std::cout << "[gcvo][debug] H =\n" << H_dbg << "\n";
+      std::cout << "[gcvo][debug] R =\n" << R_new_dbg << "\n";
+      std::cout << "[gcvo][debug] t^T = " << t_new_dbg.transpose() << "\n";
+      std::cout << "[gcvo][debug] dist = " << dist_this_iter << "\n";
+    }
+
+    // Optionally decay ell for SCALAR kernel
+    if (params_.kernel_type == CvoKernelType::SCALAR) {
+      const float ip_indicator = sum_of_A; //A_sum(&state.A_host, k);
+      const bool decay = (it > params_.ell_decay_start) &&
+        //should_decay_ell(ind_start, ind_end, ind_start_sum, ind_end_sum, ip_indicator, params_)
+        should_decay_ell_ema(ema, ema_init, cooldown, ip_indicator, params_);
+      if (decay && state.ell > params_.ell_min) {
+        state.ell = std::max(params_.ell_min, state.ell * params_.ell_decay_rate);
+      }
+    }
+    
+    // Update neighbor count
+    if (state.use_kdtree) {
+      const float avg_nnz = static_cast<float>(state.A_host.nonzero_sum) / static_cast<float>(state.num_fixed);
+      const int k_next = static_cast<int>(std::ceil(avg_nnz));
+      k = std::min(k_cap, std::max(1, k_next));
+    } else {
+      const unsigned int k_max_row = max_neighbors(&state.A_host);
+      const int k_next = static_cast<int>(std::ceil(1.2 * static_cast<double>(k_max_row)));
+      k = std::min(k_cap, std::max(1, k_next));
+    }
+  }
+
+  cudaEventRecord(ev_stop, 0);
+  cudaEventSynchronize(ev_stop);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, ev_start, ev_stop);
+  cudaEventDestroy(ev_start);
+  cudaEventDestroy(ev_stop);
+
+  if (registration_seconds) *registration_seconds = static_cast<double>(ms) / 1000.0;
+  if (num_iters) *num_iters = it;
+
+  // Output T_s2t
+  // Convert back to public convention: T_s2t = inv(T_t2s) = [R^T, -R^T t].
+  T_s2t_out = Eigen::Matrix4f::Identity();
+  {
+    const Eigen::Matrix3f R_s2t = R.transpose();
+    const Eigen::Vector3f t_s2t = -R_s2t * t;
+    T_s2t_out.block<3, 3>(0, 0) = R_s2t;
+    T_s2t_out.block<3, 1>(0, 3) = t_s2t;
+  }
+
+  if (association) {
+    gpu_association_to_cpu(state.A_host, *association, state.num_fixed, state.num_moving, k);
+  }
+
+  cudaProfilerStop();
+  
+  return 0;
+}
+
+template <typename PointT, int KdTreeKMax>
+CvoResultInfo CvoGPU<PointT, KdTreeKMax>::align(const PointCloud& source,
+                                    const PointCloud& target,
+                                    const Eigen::Matrix4f& T_s2t_init,
+                                    bool return_association) const {
+  CvoResultInfo out;
+  out.T_s2t = T_s2t_init;
+  out.return_code = align(source, target, T_s2t_init, out.T_s2t,
+                          return_association ? &out.association : nullptr,
+                          &out.num_iters, &out.registration_seconds);
+  return out;
+}
+
+template <typename PointT, int KdTreeKMax>
+float CvoGPU<PointT, KdTreeKMax>::inner_product_gpu_(const PointCloud& source,
+                                         const PointCloud& target,
+                                         const Eigen::Matrix4f& T_s2t,
+                                         float ell,
+                                         Association* assoc_out) const {
+  if (source.size() == 0 || target.size() == 0) return 0.0f;
+
+  auto src_gpu = pointcloud_to_gpu<PointT>(source);
+  auto tgt_gpu = pointcloud_to_gpu<PointT>(target);
+  CvoStateT<PointT, KdTreeKMax> state(src_gpu, tgt_gpu, params_);
+  state.ell = ell;
+
+  const int k_cap = state.use_kdtree
+                      ? std::min(KdTreeKMax, params_.nearest_neighbors_max)
+                      : params_.nearest_neighbors_max;
+  const int k = std::max(1, k_cap);
+
+  // Apply inverse(T_s2t) to map moving->fixed.
+  //const Eigen::Matrix4f T_inv = T_s2t.inverse();
+  const Eigen::Matrix3f R = T_s2t.block<3, 3>(0, 0);
+  const Eigen::Vector3f t = T_s2t.block<3, 1>(0, 3);
+  GCVO_GPU_CHECK(cudaMemcpy(state.R_gpu, &R, sizeof(Eigen::Matrix3f), cudaMemcpyHostToDevice));
+  GCVO_GPU_CHECK(cudaMemcpy(state.t_gpu, &t, sizeof(Eigen::Vector3f), cudaMemcpyHostToDevice));
+
+  const bool update_normal_cov = (params_.kernel_type != CvoKernelType::SCALAR);
+  cuda_detail::transform_pointcloud_thrust<PointT>(state.cloud_moving_init, state.cloud_moving_tf,
+                                                   state.R_gpu, state.t_gpu, update_normal_cov);
+  //GCVO_GPU_CHECK(cudaDeviceSynchronize());
+  GCVO_GPU_CHECK(cudaGetLastError());
+
+  state.reset_state_at_new_iter(k);
+
+  const int threads = GCVO_CUDA_THREADS;
+  const int blocks = (state.num_fixed + threads - 1) / threads;
+
+  if (state.use_kdtree) {
+    state.kdtree_moving->SetInputCloud(state.cloud_moving_tf);
+    state.kdtree_moving->NearestKSearch(
+        state.cloud_fixed,
+        k,
+        thrust::raw_pointer_cast(state.kdtree_inds_results.data()),
+        static_cast<int>(state.kdtree_inds_results.size()));
+    GCVO_GPU_CHECK(cudaDeviceSynchronize());
+    GCVO_GPU_CHECK(cudaGetLastError());
+
+    fill_in_A_mat_cukdtree_kernel<PointT><<<blocks, threads>>>(
+        params_gpu_,
+        thrust::raw_pointer_cast(state.cloud_fixed->points.data()), state.num_fixed,
+        thrust::raw_pointer_cast(state.cloud_moving_tf->points.data()), state.num_moving,
+        thrust::raw_pointer_cast(state.kdtree_inds_results.data()),
+        k,
+        state.ell,
+        state.A);
+  } else {
+    fill_in_A_mat_bruteforce_kernel<PointT><<<blocks, threads>>>(
+        params_gpu_,
+        thrust::raw_pointer_cast(state.cloud_fixed->points.data()), state.num_fixed,
+        thrust::raw_pointer_cast(state.cloud_moving_tf->points.data()), state.num_moving,
+        k,
+        state.ell,
+        state.A);
+  }
+  GCVO_GPU_CHECK(cudaDeviceSynchronize());
+  GCVO_GPU_CHECK(cudaGetLastError());
+  compute_nonzeros(&state.A_host);
+
+  const float ip = A_sum(&state.A_host, k);
+
+  if (assoc_out) {
+    gpu_association_to_cpu(state.A_host, *assoc_out, state.num_fixed, state.num_moving, k);
+  }
+  return ip;
+}
+
+template <typename PointT, int KdTreeKMax>
+float CvoGPU<PointT, KdTreeKMax>::function_angle(const PointCloud& source,
+                                     const PointCloud& target,
+                                     const Eigen::Matrix4f& T_s2t,
+                                     float ell,
+                                     bool is_approximate) const {
+  if (source.size() == 0 || target.size() == 0) return 0.0f;
+  const float fxy = inner_product_gpu_(source, target, T_s2t, ell, nullptr);
+
+  float fx_norm = 0.0f;
+  float fy_norm = 0.0f;
+  if (is_approximate) {
+    fx_norm = std::sqrt(static_cast<float>(source.size()));
+    fy_norm = std::sqrt(static_cast<float>(target.size()));
+  } else {
+    const Eigen::Matrix4f I = Eigen::Matrix4f::Identity();
+    fx_norm = std::sqrt(std::max(0.0f, inner_product_gpu_(source, source, I, ell, nullptr)));
+    fy_norm = std::sqrt(std::max(0.0f, inner_product_gpu_(target, target, I, ell, nullptr)));
+  }
+
+  const float denom = fx_norm * fy_norm;
+  if (denom < 1e-12f) return 0.0f;
+  return fxy / denom;
+}
+
+}  // namespace gcvo
