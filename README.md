@@ -108,7 +108,8 @@ accumulates a trajectory.
   --kitti_root /path/to/kitti/dataset \
   --sequence 09 --start 0 --count 10000 \
   --traj_file kitti_09.txt \
-  --voxel_mode pcl          # pcl (default) or fast (VoxelMapFirstPoint)
+  --max_iter 40 \            # default: 10000. set to 40 for fast runtime
+  --voxel_mode fast          # pcl (default) or fast (VoxelMapFirstPoint)
 ```
 
 
