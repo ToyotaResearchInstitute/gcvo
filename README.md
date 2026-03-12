@@ -5,7 +5,7 @@ point clouds by **maximizing a kernelized inner product in a repoducible kernel 
 
 Given a source and target cloud, the solver:
 
-1. Builds a sparse kernel/correspondence matrix between nearby point pairs.
+1. Builds a sparse kernel/correlation matrix between nearby point pairs.
 2. Runs second-order iterations on SE(3) until convergence.
 
 The kernel combines **geometry** (Euclidean or Mahalanobis distance) and
@@ -35,6 +35,12 @@ filters).  PCL visualization is only needed when `GCVO_BUILD_VIZ=ON`.
 The repo ships a Stanford Bunny PCD (`demo_data/bunny.pcd`) and three CTest
 targets.
 
+You can run them through CTest:
+
+```bash
+cd build && ctest --output-on-failure
+```
+or run the tests one by one:
 ```bash
 # Inner-product sanity check (single GN step, small rotation)
 ./build/gcvo_test_gn \
@@ -55,11 +61,7 @@ targets.
   --n 2000
 ```
 
-All should print `PASS`.  You can also run them through CTest:
-
-```bash
-cd build && ctest --output-on-failure
-```
+All should print `PASS`.  
 
 To save before/after alignment PCD files (src in red, target in blue):
 
@@ -116,7 +118,7 @@ gcvo/
   include/gcvo/           Public headers
     GCvoGPU.hpp            Solver class (declaration only -- no CUDA includes)
     GCvoParams.hpp         Runtime parameters + YAML loader
-    Correlation.hpp   Sparse correspondence matrix (struct + function declarations)
+    Correlation.hpp   Sparse correlation matrix (struct + function declarations)
     impl/                 CUDA implementation headers (header-only, compiled by NVCC)
       GCvoGPU_impl.cuh                    Full solver implementation
       Correlation_impl.cuh           Sparse matrix GPU helpers
@@ -284,7 +286,7 @@ optimisation (coarse-to-fine).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_neighbors` | int | 64 | Max neighbours per point when building the correspondence matrix |
+| `max_neighbors` | int | 64 | Max neighbours per point when building the correlation matrix |
 | `neighbor_decay` | int | 0 | `1` = adaptively shrink k based on max neighbours actually used per iteration, `0` = disabled |
 
 ### Feature / geometry toggles
@@ -330,7 +332,9 @@ use_ema_indicator: 1
 
 ## Adding a new point type
 
-GCVO is header-only -- adding a new point type requires just **one file**.
+GCVO is header-only -- all solver and kernel code lives in `.cuh` headers.
+Adding a new point type requires **no changes to the library itself**; you
+choose how to instantiate it.
 
 ### 1. Define and register the PCL point type
 
@@ -358,11 +362,16 @@ struct must provide the fields the CUDA kernels expect:
 - `features[N]` -- feature vector, with `static const unsigned int FEATURE_DIMENSION = N`
 - `normal[3]`, `covariance[9]`, `cov_eigenvalues[3]` -- filled by `compute_covariance()`
 
-### 2. Create the instantiation file
+### 2. Instantiate the templates
 
-Add a single `.cu` file under `src/instantiations/`.  Include the header
-where your new type is defined (the custom header from step 1, or
-`PointTypes19.hpp` if you added it there):
+You have two options.  Both produce identical code; pick the one that fits
+your build setup.
+
+#### Option A -- Separate instantiation file (recommended for shared libraries)
+
+Add a single `.cu` file under `src/instantiations/` and register it with
+CMake.  This produces a dedicated static library that any number of `.cpp`
+targets can link without needing NVCC themselves:
 
 ```cpp
 // gcvo/src/instantiations/GCvoGPU_ps8.cu
@@ -376,16 +385,49 @@ template void gcvo::GCvoPointCloudT<gcvo::PointS8>::compute_covariance(
     float, float, int, int, bool, bool);
 ```
 
-### 3. Add to CMake
-
-Use the helper function in `CMakeLists.txt`:
-
 ```cmake
 gcvo_add_point_type(gcvo_s8 gcvo/src/instantiations/GCvoGPU_ps8.cu)
+target_link_libraries(my_app PRIVATE gcvo_s8)
 ```
 
-Then link your app against `gcvo_s8`.  That's it -- one `.cu` file, one CMake
-line, and all solver + covariance code is instantiated for your type.
+#### Option B -- Instantiate directly in your runner (simplest)
+
+If your application is already a `.cu` file (compiled with NVCC), you can
+skip the separate instantiation entirely.  Just include the impl headers and
+add the two instantiation lines at the bottom of your runner:
+
+```cuda
+// my_runner.cu  -- compiled with NVCC
+#include "gcvo/utils/PointS8.hpp"
+#include "gcvo/GCvoGPU.hpp"
+#include "gcvo/impl/GCvoGPU_impl.cuh"
+#include "gcvo/impl/GCvoPointCloud_covariance_impl.cuh"
+
+// Explicit instantiation for your type -- this is all the "library" needs.
+template class gcvo::GCvoGPU<gcvo::PointS8>;
+template void gcvo::GCvoPointCloudT<gcvo::PointS8>::compute_covariance(
+    float, float, int, int, bool, bool);
+
+int main() {
+  gcvo::GCvoGPU<gcvo::PointS8> solver("params.yaml");
+
+  gcvo::GCvoPointCloudT<gcvo::PointS8> src(pcl_cloud_src);
+  gcvo::GCvoPointCloudT<gcvo::PointS8> tgt(pcl_cloud_tgt);
+
+  auto result = solver.align(src, tgt, Eigen::Matrix4f::Identity());
+  std::cout << "T_s2t:\n" << result.T_s2t << "\n";
+}
+```
+
+```cmake
+# Link only the header-only interface -- no pre-compiled gcvo_sN library needed.
+add_executable(my_runner my_runner.cu)
+target_link_libraries(my_runner PRIVATE gcvo_headers)
+```
+
+This works because **all GCVO code is in headers**; the pre-built static
+libraries (`gcvo_s1`, `gcvo_s3`, ...) are just a convenience so that
+downstream `.cpp` files never need NVCC.
 
 
 ## Writing CUDA-free applications
