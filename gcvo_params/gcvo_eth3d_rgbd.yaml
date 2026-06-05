@@ -23,7 +23,6 @@ kernel_type: 1                    # DENSE anisotropic
 kernel_eval_max_dist: 0.25        # matches paper 2nd-order setting
 neighbor_decay: 1
 verbose: 0
-use_symmetrization: 0
 use_connection_term: 1
 use_ell2_in_kernel: 0             # OFF for ETH3D (opposite of KITTI; bias compounds indoors)
 cov_eig_min: 0.001                # tight clamp critical; 0.01 breaks tracking

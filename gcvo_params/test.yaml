@@ -20,4 +20,3 @@ use_kdtree: 0
 kernel_type: 1
 kernel_eval_max_dist: 0.5
 verbose: 0
-use_ema_indicator: 1 # 0=queue (original), 1=EMA

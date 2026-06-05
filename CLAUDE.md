@@ -100,10 +100,8 @@ The most impactful parameters in YAML configs under `gcvo_params/`:
 - `kernel_type`: 0=SCALAR, 1=DENSE, 2=RESCALED
 - `use_geometry` / `use_features`: Toggle XYZ and feature-vector contributions to the kernel
 - `tol` / `tol_2`: Convergence thresholds (inner-product change and gradient norm)
-- `indicator_window` / `use_ema_indicator`: Stability detection before triggering length-scale decay
-- `use_connection_term`: Add SE(3) Christoffel-symbol correction to curvature matrix (default 1)
-- `use_symmetrization`: Symmetrize `B_gn` before LDLT (default 1; setting 0 is often better)
-- `use_h1_term` / `use_h2_term` / `use_h3_term`: Include H1/H2/H3 exact-Hessian correction terms (default 0; H4 = GN term always active)
+- `indicator_window` / `indicator_threshold`: Sliding-window inner-product stability test that triggers length-scale decay
+- `use_connection_term`: Add the SE(3) Christoffel correction (`-gamma^T`) to the GN curvature matrix (default 1)
 - `cov_eig_min` / `cov_eig_max`: Clamp per-point covariance eigenvalues (0 = disabled)
 - `use_ell2_in_kernel`: Add ℓ²·I regularization in `cov_sum_inv_plus_l2I` (default 1; set 0 when eigenvalue clamping is active)
 - `kernel_euclidean_max_dist`: Euclidean squared-distance pre-filter for DENSE/RESCALED kernel (default inf; e.g. 1.0 = 1 m cutoff)
@@ -113,7 +111,7 @@ The most impactful parameters in YAML configs under `gcvo_params/`:
 - **Ground truth**: Use LiDAR-frame GT from `~/code/docker_home/cvo/RKHS_BA/ground_truth/kitti/lidar/` (not the camera-frame poses in the KITTI dataset itself).
 - **Broken sequences**: Seqs 01, 04, 10 have GT frame issues — exclude from comparisons.
 - **First-frame initialization**: With `l_init=0.1`, the first frame (identity init, ~0.5 m displacement) gets stuck in a local minimum. Use `--first_frame_l_init 1.0` to set a coarser scale for the first pair only; subsequent frames use warm-start and work fine with `l_init=0.1`.
-- **Best baseline so far**: `use_symmetrization: 0` (no_sym) gives ~1–1.6% t_rel on working sequences.
+- **Production config**: `gcvo_params/cf_B_eigclamp.yaml` (DENSE kernel + per-point Σ eigenvalue clamping `[0.01, 10.0]` + 0.205° Velodyne calibration + centroid voxel) achieves mean t_rel **1.345% ± 0.42** across all 11 sequences (see `results/2026-06-01/kitti_eigclamp_calib_winner/`).
 
 ### Third-Party Vendored Code
 

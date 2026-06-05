@@ -241,42 +241,4 @@ if (GCVO_BUILD_TESTS)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
-  # Hessian term unit tests (H1, H2, H3 analytical vs GPU kernel).
-  # Links gcvo_headers to avoid duplicate symbols (same pattern as test_gn).
-  add_executable(gcvo_test_hessian_terms gcvo/tests/test_hessian_terms.cu)
-  target_link_libraries(gcvo_test_hessian_terms PRIVATE gcvo_headers)
-  target_compile_options(gcvo_test_hessian_terms PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-  )
-  add_test(
-    NAME gcvo_test_hessian_terms
-    COMMAND gcvo_test_hessian_terms --params ${GCVO_TEST_PARAMS}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  )
-
-  # 2-frame KITTI test — only registered when GCVO_TEST_KITTI_ROOT is set.
-  set(GCVO_TEST_KITTI_ROOT "" CACHE PATH "KITTI odometry dataset root (enables 2-frame test)")
-  if (GCVO_TEST_KITTI_ROOT)
-    add_executable(gcvo_test_two_frame_kitti gcvo/tests/test_two_frame_kitti.cu)
-    target_link_libraries(gcvo_test_two_frame_kitti PRIVATE gcvo_s1)
-    target_compile_definitions(gcvo_test_two_frame_kitti PRIVATE
-      GCVO_TEST_KITTI_ROOT="${GCVO_TEST_KITTI_ROOT}")
-    add_test(
-      NAME gcvo_test_two_frame_kitti
-      COMMAND gcvo_test_two_frame_kitti
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-
-    add_executable(gcvo_test_pitch_diagnostic gcvo/tests/test_pitch_diagnostic.cu)
-    target_link_libraries(gcvo_test_pitch_diagnostic PRIVATE gcvo_s1)
-    target_compile_definitions(gcvo_test_pitch_diagnostic PRIVATE
-      GCVO_TEST_KITTI_ROOT="${GCVO_TEST_KITTI_ROOT}")
-    # No add_test — this is a manual diagnostic.
-
-    add_executable(gcvo_test_symmetry_real gcvo/tests/test_symmetry_real.cu)
-    target_link_libraries(gcvo_test_symmetry_real PRIVATE gcvo_s1)
-    target_compile_definitions(gcvo_test_symmetry_real PRIVATE
-      GCVO_TEST_KITTI_ROOT="${GCVO_TEST_KITTI_ROOT}")
-  endif()
-
 endif()

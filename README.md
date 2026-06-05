@@ -209,10 +209,7 @@ cmake .. -DGCVO_TEST_SAVE_PCD=ON && make -j
 | `--random_downsample` | `0` (off) | Randomly subsample to N points (applied after voxel) |
 | `--max_iter` | `10000` | Override max GN iterations from YAML |
 | `--first_frame_l_init` | `0.0` (off) | If `>0`, use this coarser `l_init` (with `ℓ²·I` enabled) for the first pair only — escapes the local minimum from identity initialization |
-| `--cov_eig_rescale P T` | off | RKHS_BA-style eigenvalue rescaling, `plane_thresh=P`, `tangent_thresh=T` (typical KITTI: `0.1 100`) |
-| `--identity_init` | off | Reset init to identity every frame (disables warm-start; diagnostic only) |
 | `--kitti_vert_calib_deg` | `0.0` (off) | Per-point Velodyne HDL-64E vertical-angle correction (degrees). Set to `0.205` to match RKHS_BA's `KittiHandler` |
-| `--init_row "r00,r01,...,r23"` | identity | Override the first-pair init transform (12 floats, 3×4 row-major). Lets you replay a frame with an arbitrary warm-start |
 | `--visualize` | off | Live point-cloud viewer (requires `-DGCVO_BUILD_VIZ=ON`) |
 
 For real-time computation, combine voxel + random downsampling with a tight iteration cap:
@@ -241,7 +238,7 @@ For best benchmark accuracy, use the full production config:
 
 ### YAML parameter highlights
 
-The production `cf_B_eigclamp.yaml` adds three GCVO-specific knobs on top of the
+The production `cf_B_eigclamp.yaml` adds four GCVO-specific knobs on top of the
 classic RKHS_BA params:
 
 | YAML key | Default | Description |
@@ -249,9 +246,7 @@ classic RKHS_BA params:
 | `cov_eig_min` | `0.0` (off) | Clamp per-point covariance eigenvalues to this minimum. Critical floor that prevents `(Σ_a + Σ_b)^{-1}` from blowing up when KNN gives a near-degenerate Σ. KITTI prod uses `0.01`. |
 | `cov_eig_max` | `0.0` (off) | Clamp per-point covariance eigenvalues to this maximum. KITTI prod uses `10.0`. |
 | `use_ell2_in_kernel` | `1` | Add `ℓ²·I` regularization inside `(Σ_a + Σ_b + ℓ²I)^{-1}`. Set `0` for sharp anisotropic matching (KITTI prod); set `1` to soften (helps low-texture or sparse-overlap pairs). |
-| `use_connection_term` | `1` | Include the SE(3) Christoffel correction in the curvature matrix. `0` disables, `1` subtracts (correct), `2` adds (diverges — diagnostic only). |
-| `use_symmetrization` | `1` | Symmetrize `B_gn` before LDLT. `0` is usually better in practice. |
-| `use_h1_term`, `use_h2_term`, `use_h3_term` | `0` | Optional exact-Hessian correction terms. H4 (Gauss-Newton) is always active. On KITTI, none of H1/H2/H3 measurably improve the benchmark; H1 destabilizes the solver on several sequences. |
+| `use_connection_term` | `1` | Include the SE(3) Christoffel correction (`-gamma^T`) in the GN curvature matrix. `0` disables. |
 | `kernel_euclidean_max_dist` | `inf` | Pre-filter neighbors farther than this Euclidean distance². Set to `1.0` (1 m) on dense scenes to cap kernel cost. |
 
 
@@ -422,7 +417,6 @@ optimisation (coarse-to-fine).
 | `tol_2` | float | 1.2e-5 | Secondary (tighter) convergence threshold |
 | `indicator_window` | int | 15 | Window size for the l-decay stability indicator |
 | `indicator_threshold` | float | 0.2 | Threshold below which inner-product change is considered stable |
-| `use_ema_indicator` | int | 0 | `0` = sliding-window indicator (original), `1` = EMA-based indicator |
 
 ### Neighbour search
 
@@ -468,7 +462,6 @@ use_features: 1
 kernel_type: 0
 kernel_eval_max_dist: 1
 verbose: 1
-use_ema_indicator: 1
 ```
 
 

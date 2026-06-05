@@ -21,4 +21,3 @@ kernel_type: 1 #0
 kernel_eval_max_dist: 1
 neighbor_decay: 1
 verbose: 0
-use_ema_indicator: 0 #1 # 0=queue (original), 1=EMA

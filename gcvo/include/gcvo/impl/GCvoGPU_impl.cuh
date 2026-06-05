@@ -325,61 +325,18 @@ __global__ void compute_hessian_gn_kernel(const GCvoParams* params,
     const Eigen::Vector3f r = x - y;
 
     // Jacobian (legacy): J = [ -skew(y), I ]
-    const Eigen::Matrix3f skew_y = skew3(y);
     Eigen::Matrix<float, 3, 6> J;
-    J.block<3, 3>(0, 0) = -skew_y;
+    J.block<3, 3>(0, 0) = -skew3(y);
     J.block<3, 3>(0, 3) = Eigen::Matrix3f::Identity();
 
-    Eigen::Vector3f Sr;
     if (!use_covariance) {
       const float w = l2_inv;
       Hi.noalias() += w_ij * (J.transpose() * w * J);
       gi.noalias() += w_ij * (J.transpose() * w * r);
-      Sr = r * l2_inv;
     } else {
       const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_l2I(px.covariance, py.covariance, l2);
       Hi.noalias() += w_ij * (J.transpose() * cov_inv * J);
       gi.noalias() += w_ij * (J.transpose() * cov_inv * r);
-      Sr = cov_inv * r;
-
-      // H3: f·J^T·D(S)[ξ]·r — covariance-derivative term (DENSE/RESCALED only).
-      // D(S)[ξ] acting on r via the chain: S = (Σ_x + R·Σ_y·R^T + l²I)^{-1},
-      // Linearize in ξ=(ω,v): D(R·Σ_y·R^T)[ξ] = [ω,Σ_y]_rot, giving
-      // D(S)[ξ]·r = -S·D(Σ_sum)[ξ]·S·r = -S·([ω^∧,Σ_y]·Sr) = -S·(ω^∧·Σ_y·Sr - Σ_y·ω^∧·Sr)
-      // Per pair: top 3 of J^T is -y^∧, bot 3 is I. J^T·D(S)[ξ]·r has shape (6,1) acting on ξ.
-      // Collecting the (6×6) matrix contribution:
-      if (params->use_h3_term) {
-        Eigen::Map<const Eigen::Matrix<float,3,3,Eigen::RowMajor>> Sigma_y(py.covariance);
-        const Eigen::Vector3f Sy_Sr = Sigma_y * Sr;
-        // M3 = skew(Σ_y·Sr) - Σ_y·skew(Sr)  [3x3, multiplied by ω on the right]
-        const Eigen::Matrix3f M3 = skew3(Sy_Sr) - Sigma_y * skew3(Sr);
-        const Eigen::Matrix3f S_M3 = cov_inv * M3;  // [3x3]
-        // J^T top 3: -y^∧,  bot 3: I
-        Hi.template block<3,3>(0,0).noalias() -= w_ij * skew_y * S_M3;
-        Hi.template block<3,3>(3,0).noalias() -= w_ij * S_M3;
-      }
-    }
-
-    // H2: f·D(J^T)[ξ]·S·r — Jacobian-derivative term (all kernel types).
-    // D(J^T)[ξ]·Sr has top-3 = skew(Sr)^T·ξ_ω term, giving per-pair (6×6):
-    //   top-left  = (Sr·y)·I - y·Sr^T   [acts on ω]
-    //   top-right = skew(Sr)             [acts on v]
-    //   bot rows  = 0
-    if (params->use_h2_term) {
-      const float sr_dot_y = Sr.dot(y);
-      const Eigen::Matrix3f tl = sr_dot_y * Eigen::Matrix3f::Identity() - y * Sr.transpose();
-      const Eigen::Matrix3f tr = skew3(Sr);
-      Hi.template block<3,3>(0,0).noalias() += w_ij * tl;
-      Hi.template block<3,3>(0,3).noalias() += w_ij * tr;
-    }
-
-    // H1: -f·(J^T·S·r)·(J^T·S·r)^T — kernel-weight-derivative term (all kernel types).
-    // J^T·S·r = [y^∧·Sr; Sr]  (6-vector).
-    if (params->use_h1_term) {
-      Eigen::Matrix<float,6,1> JtSr;
-      JtSr.template head<3>() = skew_y * Sr;
-      JtSr.template tail<3>() = Sr;
-      Hi.noalias() -= w_ij * (JtSr * JtSr.transpose());
     }
   }
 
@@ -495,88 +452,6 @@ static inline bool should_decay_l(std::queue<float>& decay_q_start,
 }
 
 // -----------------------------
-// L decay indicator — EMA-based
-// -----------------------------
-// Maintains two EMA accumulators (slow="start", fast="end") to detect when
-// the inner-product indicator has stabilized. Triggers l decay when
-// end_ema / start_ema falls within [1 ± indicator_threshold].
-//
-// All mutable state (ema, start_ema, end_ema, flags, cooldown) is passed by
-// reference so each align() call has its own independent state.
-//
-// alpha: EMA smoothing factor for the raw indicator (0 < alpha <= 1).
-// cooldown_iters: after a decay, suppress further decays for this many iters;
-//                 initialize cooldown_iters_left = l_decay_start to skip
-//                 the warm-up phase.
-static inline bool should_decay_l_ema(
-    float& ema,               // state: smoothed indicator EMA
-    bool&  ema_initialized,   // state: init flag for ema
-    int&   cooldown_iters_left, // state: remaining cooldown iters (init to l_decay_start)
-    float& start_ema,         // state: slow EMA ("start" window)
-    float& end_ema,           // state: fast EMA ("end" window)
-    bool&  ema_windows_inited,// state: init flag for start/end EMAs
-    int&   ema_warmup_left,   // state: warmup counter (init to indicator_window)
-    float  indicator,         // input: raw indicator value (e.g. correlation_sum)
-    const GCvoParams& params,
-    float  alpha            = 0.2f,   // smoothing for raw indicator
-    float  min_indicator    = 1e-6f,  // guard against near-zero denom
-    int    cooldown_iters   = 0       // 0 disables post-decay cooldown
-) {
-  // Step 0: decrement cooldown counter each iteration.
-  if (cooldown_iters_left > 0) {
-    cooldown_iters_left--;
-  }
-
-  // Step 1: update smoothed EMA of the raw indicator.
-  if (!ema_initialized) {
-    ema = indicator;
-    ema_initialized = true;
-  } else {
-    ema = (1.0f - alpha) * ema + alpha * indicator;
-  }
-
-  // Step 2: update slow ("start") and fast ("end") EMA windows.
-  // EMA rates derived from indicator_window so that effective memory
-  // is ~win iters (fast) and ~2*win iters (slow).
-  const int   win    = std::max(1, params.indicator_window);
-  const float a_fast = std::min(1.0f, 2.0f / float(win     + 1));
-  const float a_slow = std::min(1.0f, 2.0f / float(2*win   + 1));
-
-  if (!ema_windows_inited) {
-    start_ema = ema;
-    end_ema   = ema;
-    ema_windows_inited = true;
-    return false;
-  }
-
-  start_ema = (1.0f - a_slow) * start_ema + a_slow * ema;
-  end_ema   = (1.0f - a_fast) * end_ema   + a_fast * ema;
-
-  // Step 3: fire decay if indicator has stabilized, cooldown has elapsed, and
-  // the windows have had enough iterations to diverge meaningfully.
-  if (cooldown_iters_left > 0) return false;
-
-  if (ema_warmup_left > 0) {
-    ema_warmup_left--;
-    return false;
-  }
-
-  const float denom = std::max(std::fabs(start_ema), min_indicator);
-  const float ratio = end_ema / denom;
-  const float lo    = 1.0f - params.indicator_threshold;
-  const float hi    = 1.0f + params.indicator_threshold;
-
-  if (ratio > lo && ratio < hi) {
-    if (cooldown_iters > 0) cooldown_iters_left = cooldown_iters;
-    // Reset windows so next decay cycle starts fresh.
-    ema_windows_inited = false;
-    ema_warmup_left    = win;
-    return true;
-  }
-  return false;
-}
-
-// -----------------------------
 // PointCloud -> GPU helper
 // -----------------------------
 template <typename PointT>
@@ -668,17 +543,14 @@ static Eigen::Matrix<float, 6, 1> compute_gn_update(const GCvoParams& params_cpu
   gamma.template block<3,3>(0,0) = -0.5f * gw_skew;
   gamma.template block<3,3>(3,0) = -gv_skew;
 
-  // use_connection_term: 0=off, 1=subtract gamma^T (default), 2=add gamma^T
-  if (params_cpu.use_connection_term == 1)
+  // Connection term: subtract gamma^T from H (default on). The minus sign
+  // cancels with grad_f = -g so the SE(3) Christoffel correction enters with
+  // the right sign.
+  if (params_cpu.use_connection_term)
     Hmod = (Hmod - gamma.transpose()).eval();
-  else if (params_cpu.use_connection_term == 2)
-    Hmod = (Hmod + gamma.transpose()).eval();
 
   // GN solve: dx = B_gn^{-1} grad_f
-  const Mat66 Hsym = params_cpu.use_symmetrization
-                       ? (0.5f * (Hmod + Hmod.transpose())).eval()
-                       : Hmod;
-  Eigen::LDLT<Mat66> ldlt(Hsym);
+  Eigen::LDLT<Mat66> ldlt(Hmod);
   Vec6 dx = ldlt.solve(grad_f);
   if (!dx.array().isFinite().all()) {
     dx.setZero();
@@ -723,18 +595,10 @@ int GCvoGPU<PointT>::align(const PointCloud& source,
   Eigen::Matrix3f R = T_t2s_init.block<3, 3>(0, 0);
   Eigen::Vector3f t = T_t2s_init.block<3, 1>(0, 3);
 
-  // Queue-based l-decay state (original)
+  // Queue-based l-decay state
   std::queue<float> decay_q_start, decay_q_end;
   float decay_sum_start = 0.0f;
   float decay_sum_end   = 0.0f;
-  // EMA-based l-decay state (all per-call, no static storage)
-  float ema_val       = 0.0f;
-  bool  ema_init      = false;
-  int   ema_cooldown  = params_align.l_decay_start;
-  float ema_start     = 0.0f;
-  float ema_end       = 0.0f;
-  bool  ema_wins_init = false;
-  int   ema_warmup    = params_align.indicator_window;
 
   cudaEvent_t ev_start, ev_stop;
   cudaEventCreate(&ev_start);
@@ -832,17 +696,10 @@ int GCvoGPU<PointT>::align(const PointCloud& source,
     // cov_sum_inv_plus_l2I, so decaying l progressively tightens the kernel.
     {
       const float corr_indicator = correlation_sum_device(state.corr_host, k);
-      bool decay = false;
-      if (params_align.use_ema_indicator) {
-        decay = should_decay_l_ema(
-            ema_val, ema_init, ema_cooldown,
-            ema_start, ema_end, ema_wins_init, ema_warmup,
-            corr_indicator, params_align);
-      } else {
-        decay = (it > params_align.l_decay_start) &&
-                should_decay_l(decay_q_start, decay_q_end, decay_sum_start, decay_sum_end,
-                                 corr_indicator, params_align);
-      }
+      const bool decay =
+          (it > params_align.l_decay_start) &&
+          should_decay_l(decay_q_start, decay_q_end, decay_sum_start, decay_sum_end,
+                         corr_indicator, params_align);
       if (decay && state.l > params_align.l_min) {
         state.l = std::max(params_align.l_min, state.l * params_align.l_decay_rate);
       }

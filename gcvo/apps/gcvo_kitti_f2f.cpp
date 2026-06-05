@@ -80,20 +80,11 @@ struct Args {
   int random_downsample = 0;      // 0 = disabled; >0 = target number of points
   int max_iter = 10000;           // overrides yaml max_iterations
   float first_frame_l_init = 0.0f; // if >0, override l_init for the first frame only
-  // Eigenvalue rescaling (RKHS_BA-style) — applied after compute_covariance().
-  // Off when plane_thresh <= 0.
-  float cov_plane_thresh = 0.0f;
-  float cov_tangent_thresh = 0.0f;
-  // Diagnostic: if true, reset init to identity for every frame (disables warm-start).
-  bool identity_init = false;
-  // Voxel cell size in meters (used by 'fast' and 'centroid' modes).
+  // Voxel cell size in meters (used by 'fast', 'centroid', 'voxel_random' modes).
   float voxel_size = 0.25f;
   // Apply per-point intrinsic calibration (Velodyne HDL-64E vertical angle offset).
   // RKHS_BA uses 0.205°. Set 0 to disable.
   float kitti_vertical_angle_offset_deg = 0.0f;
-  // If set, override the first-pair init (3x4 row-major, 12 comma-separated floats).
-  // Lets us replay a frame with an arbitrary warm-start (e.g., from a prior failed run).
-  std::string init_row_str;
 };
 
 static void print_usage(const char* argv0) {
@@ -110,8 +101,7 @@ static void print_usage(const char* argv0) {
       << "--random_downsample N: randomly subsample to N points (applied after voxel, or alone if voxel_mode=none).\n"
       << "--max_iter N: override max iterations from YAML (default 10000).\n"
       << "--first_frame_l_init L: use l_init=L for the first pair only (identity init; 0=disabled).\n"
-      << "--cov_eig_rescale P T: RKHS_BA eigenvalue rescaling, plane_thresh=P, tangent_thresh=T\n"
-      << "                       (typical KITTI: 0.1 100). 0=disabled.\n"
+      << "--kitti_vert_calib_deg D: per-point Velodyne HDL-64E vertical-angle correction (RKHS_BA uses 0.205).\n"
       << "--visualize requires building with -DGCVO_BUILD_VIZ=ON.\n";
 }
 
@@ -136,16 +126,9 @@ static bool parse_args(int argc, char** argv, Args& a) {
     else if (k == "--random_downsample") a.random_downsample = std::stoi(need("--random_downsample"));
     else if (k == "--max_iter") a.max_iter = std::stoi(need("--max_iter"));
     else if (k == "--first_frame_l_init") a.first_frame_l_init = std::stof(need("--first_frame_l_init"));
-    else if (k == "--cov_eig_rescale") {
-      a.cov_plane_thresh   = std::stof(need("--cov_eig_rescale (plane_thresh)"));
-      a.cov_tangent_thresh = std::stof(need("--cov_eig_rescale (tangent_thresh)"));
-    }
-    else if (k == "--identity_init") a.identity_init = true;
     else if (k == "--voxel_size") a.voxel_size = std::stof(need("--voxel_size"));
     else if (k == "--kitti_vert_calib_deg")
       a.kitti_vertical_angle_offset_deg = std::stof(need("--kitti_vert_calib_deg"));
-    else if (k == "--init_row")
-      a.init_row_str = need("--init_row");
     else if (k == "-h" || k == "--help") return false;
     else {
       std::cerr << "Unknown arg: " << k << "\n";
@@ -341,21 +324,6 @@ int main(int argc, char** argv) {
     //   T_0_{i+1} = T_0_i * T_i_{i+1}
     Eigen::Matrix4f T_0_i = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f init = Eigen::Matrix4f::Identity();
-    if (!a.init_row_str.empty()) {
-      std::vector<float> vals;
-      std::string s = a.init_row_str;
-      for (char& c : s) if (c == ',') c = ' ';
-      std::istringstream iss(s);
-      float v;
-      while (iss >> v) vals.push_back(v);
-      if (vals.size() != 12) {
-        throw std::runtime_error("--init_row needs 12 floats (3x4 row-major), got "
-                                 + std::to_string(vals.size()));
-      }
-      for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 4; ++c)
-          init(r, c) = vals[r * 4 + c];
-    }
 
     const bool need_cov = (static_cast<int>(solver.params().kernel_type) != 0);
     const bool is_rescaled = (solver.params().kernel_type == gcvo::GCvoKernelType::RESCALED);
@@ -414,32 +382,22 @@ int main(int argc, char** argv) {
       if (need_cov) {
         src.compute_covariance(0.1f, 100.0f, 12, 8, is_rescaled, true);
         tgt.compute_covariance(0.1f, 100.0f, 12, 8, is_rescaled, true);
-        if (a.cov_plane_thresh > 0.0f && a.cov_tangent_thresh > 0.0f) {
-          src.rescale_covariance_eigenvalues_rkhs(a.cov_plane_thresh, a.cov_tangent_thresh);
-          tgt.rescale_covariance_eigenvalues_rkhs(a.cov_plane_thresh, a.cov_tangent_thresh);
-        }
       }
 
-      // First-frame override: use a coarser l_init for the identity-initialized pair.
-      // With --identity_init, every frame uses the "first frame" l_init since each
-      // alignment starts from identity (no warm start).
-      //
-      // Additionally: when the first-frame override is active, force
-      // use_ell2_in_kernel=1 for that frame (the kernel uses (Σ+ℓ²I)⁻¹ with
-      // ℓ²=first_frame_l_init² to soften it and escape local minima). For later
-      // warm-started frames, restore the YAML setting (typically ℓ²=0 for sharp
-      // surface alignment).
+      // First-frame override: use a coarser l_init for the identity-initialized pair
+      // (escapes the local minimum from identity init). When active, force
+      // use_ell2_in_kernel=1 for that frame so the kernel uses (Σ+ℓ²I)⁻¹ with
+      // ℓ²=first_frame_l_init². For later warm-started frames, restore the YAML
+      // setting (typically ℓ²=0 for sharp surface alignment).
       if (a.first_frame_l_init > 0.0f) {
         gcvo::GCvoParams p = solver.params();
-        const bool is_first = (f == a.start || a.identity_init);
+        const bool is_first = (f == a.start);
         p.l_init = is_first ? a.first_frame_l_init : orig_l_init;
         p.use_ell2_in_kernel = is_first ? 1 : orig_use_ell2;
         solver.write_params(p);
       }
 
-      const Eigen::Matrix4f init_to_use = a.identity_init
-          ? Eigen::Matrix4f::Identity() : init;
-      gcvo::GCvoResultInfo r = solver.align(src, tgt, init_to_use, false);
+      gcvo::GCvoResultInfo r = solver.align(src, tgt, init, false);
 
       const auto t_end = std::chrono::steady_clock::now();
       const double total_sec = std::chrono::duration<double>(t_end - t_start).count();
