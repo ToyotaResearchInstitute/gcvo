@@ -9,6 +9,21 @@
   <a href="https://www.youtube.com/watch?v=D7dJ3j6qx7g">▶ Demo video on YouTube</a>
 </p>
 
+## News
+
+**2026-06-05 — KITTI benchmark (all 11 sequences, LiDAR frame-to-frame, second-order GN):**
+
+| Method                                     | mean t_rel (%) | mean r_rel (deg/m) |
+|--------------------------------------------|---------------:|-------------------:|
+| RKHS-BA paper (`cvo_aniso_gn`, Table 1)    |          1.389 |           6.89e-3  |
+| **GCVO (this repo, `cf_B_eigclamp.yaml`)** |      **1.375** |       **4.72e-3**  |
+
+Same evaluation protocol (KITTI cam0 frame, SVD-projected double-precision rotation error).
+Config: `gcvo_params/cf_B_eigclamp.yaml` (constant `ell=0.001`, fixed
+`use_ell2_in_kernel=1`, eigenvalue-clamped per-point Σ, Velodyne 0.205°
+calibration). Full per-sequence numbers and provenance in
+`results/2026-06-05/signclarity_vs_fix_kitti/ANALYSIS_ELL_SWEEP.md`.
+
 A correspondence-free point-cloud registration that estimates a rigid SE(3) transform between two
 point clouds by **maximizing a kernelized inner product in a repoducible kernel Hilbert space (RKHS)** formulation.
 
