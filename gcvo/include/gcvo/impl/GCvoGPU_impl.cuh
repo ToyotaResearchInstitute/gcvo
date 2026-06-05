@@ -337,7 +337,11 @@ __global__ void compute_hessian_gn_kernel(const GCvoParams* params,
       gi.noalias() += w_ij * (J.transpose() * w * r);
       Sr = r * l2_inv;
     } else {
-      const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_l2I(px.covariance, py.covariance, l2);
+      // Match the correlation kernel's S matrix: gate ℓ²I by use_ell2_in_kernel.
+      // Without this, the GN Hessian used (Σ+ℓ²I)⁻¹ while the correlation used Σ⁻¹,
+      // mixing two different S matrices.
+      const float effective_l2 = params->use_ell2_in_kernel ? l2 : 0.0f;
+      const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_l2I(px.covariance, py.covariance, effective_l2);
       Hi.noalias() += w_ij * (J.transpose() * cov_inv * J);
       gi.noalias() += w_ij * (J.transpose() * cov_inv * r);
       Sr = cov_inv * r;
