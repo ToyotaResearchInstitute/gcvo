@@ -29,18 +29,137 @@ make -j
 Requirements: CMake, CUDA toolkit, Eigen3, yaml-cpp, PCL (common, io,
 filters).  PCL visualization is only needed when `GCVO_BUILD_VIZ=ON`.
 
+**CMake options:**
 
-## Running the tests
+| Option | Default | Description |
+|--------|---------|-------------|
+| `GCVO_BUILD_APPS` | ON | Build command-line runners |
+| `GCVO_BUILD_TESTS` | ON | Build unit tests |
+| `GCVO_BUILD_VIZ` | OFF | Build PCL visualiser support |
+| `GCVO_TEST_SAVE_PCD` | OFF | Enable `--save_pcd` flag in tests |
+| `GCVO_CUDA_THREADS` | 256 | CUDA threads per block |
 
-The repo ships a Stanford Bunny PCD (`demo_data/bunny.pcd`) and three CTest
-targets.
 
-You can run them through CTest:
+## Quick start demos
+
+After building, you can run the demos below. No GPU dataset download is needed for the bunny test; the KITTI demos require the [KITTI odometry dataset](https://www.cvlibs.net/datasets/kitti/eval_odometry.php).
+
+### 1. Stanford Bunny alignment (no external data needed)
+
+Aligns a randomly rotated/translated copy of the bundled `demo_data/bunny.pcd` back to the original:
+
+```bash
+# From the repo root
+scripts/run_bunny.sh
+```
+
+Or run directly:
+```bash
+./build/gcvo_test_bunny_centroid \
+  --pivot origin \
+  --params gcvo_params/test.yaml \
+  --input_pcd_file demo_data/bunny.pcd \
+  --n 2000 --theta_deg 30 --t 0.5
+```
+
+Should print `PASS`.
+
+### 2. Inner-product GN sanity check
+
+```bash
+scripts/run_test_gn.bash
+```
+
+Or directly:
+```bash
+./build/gcvo_test_gn \
+  --params gcvo_params/test.yaml \
+  --input_pcd_file demo_data/bunny.pcd \
+  --n 2000 --theta_deg 15 --t 0.0
+```
+
+### 3. KITTI frame-to-frame odometry
+
+Runs GCVO as frame-to-frame visual odometry on KITTI LiDAR sequences.
+Set `KITTI_ROOT` to wherever you downloaded the KITTI odometry dataset
+(the directory containing `sequences/`).
+
+#### Production config (best benchmark results)
+
+The production setup combines four ingredients:
+- `cf_B_eigclamp.yaml` — DENSE anisotropic kernel + per-point Σ eigenvalue clamping `[0.01, 10.0]`
+- `--voxel_mode centroid` — centroid-of-voxel downsampling (replaces first-point-in-voxel)
+- `--first_frame_l_init 1.0` — coarser kernel for the identity-initialized first pair
+- `--kitti_vert_calib_deg 0.205` — Velodyne HDL-64E intrinsic vertical-angle correction
+
+```bash
+./build/gcvo_kitti_f2f \
+  --params gcvo_params/cf_B_eigclamp.yaml \
+  --kitti_root /path/to/kitti/dataset \
+  --sequence 05 --start 0 --count 999999 \
+  --voxel_mode centroid --voxel_size 0.25 \
+  --first_frame_l_init 1.0 \
+  --kitti_vert_calib_deg 0.205 \
+  --traj_file kitti_05.kitti
+```
+
+This config achieves **mean t_rel = 1.345% ± 0.42** across all 11 KITTI sequences (00–10),
+beating both the no-calibration baseline (1.632%) and the RKHS_BA reference (1.389%).
+Per-sequence trajectories and full reproduction in
+`results/2026-06-01/kitti_eigclamp_calib_winner/`.
+
+#### Quick demo (legacy scripts)
+
+```bash
+# With connection term, loops over sequences 06, 08:
+scripts/run_kitti_f2f.sh
+
+# Without connection term, loops over sequences 06, 08:
+scripts/run_kitti_f2f_no_connection.sh
+```
+
+The output trajectory file is in KITTI format (12 floats per line, 3x4 row-major).
+To evaluate on the official KITTI odometry benchmark, convert lidar→cam0 frame
+with `scripts/trajectory_change_basis.py` then run the C++ evaluator from
+[`odometry_eval/KITTI/cpp`](https://github.com/UMich-CURLY/odometry_eval).
+
+### 4. Pair-wise PCD alignment
+
+Align any two PCD files:
+```bash
+scripts/run_align_pcd.sh ./build gcvo_params/test.yaml intensity cloud_a.pcd cloud_b.pcd
+```
+
+Or directly:
+```bash
+./build/gcvo_align_pcd \
+  --params gcvo_params/test.yaml \
+  --source cloud_a.pcd --target cloud_b.pcd \
+  --type intensity            # intensity | rgb | fpfh
+```
+
+### 5. PCD sequence (frame-to-frame odometry)
+
+Point the runner at a directory of PCD files whose filenames sort
+chronologically (e.g. timestamps).  It registers consecutive pairs and
+accumulates a trajectory.
+
+```bash
+./build/gcvo_run_pcd \
+  --params gcvo_params/test.yaml \
+  --pcd_dir /path/to/pcds/ \
+  --type intensity \
+  --traj_file traj.txt        # KITTI format (12 floats per line, 3x4 row-major)
+```
+
+
+## Running all tests
 
 ```bash
 cd build && ctest --output-on-failure
 ```
-or run the tests one by one:
+
+Or run individually:
 ```bash
 # Inner-product sanity check (single GN step, small rotation)
 ./build/gcvo_test_gn \
@@ -61,7 +180,7 @@ or run the tests one by one:
   --n 2000
 ```
 
-All should print `PASS`.  
+All should print `PASS`.
 
 To save before/after alignment PCD files (src in red, target in blue):
 
@@ -75,43 +194,7 @@ cmake .. -DGCVO_TEST_SAVE_PCD=ON && make -j
 ```
 
 
-## Running the apps
-
-### Pair-wise PCD alignment
-
-```bash
-./build/gcvo_run_pcd \
-  --params gcvo_params/test.yaml \
-  --source cloud_a.pcd --target cloud_b.pcd \
-  --type intensity            # intensity | rgb | fpfh
-```
-
-### PCD sequence (frame-to-frame odometry)
-
-Point the runner at a directory of PCD files whose filenames sort
-chronologically (e.g. timestamps).  It registers consecutive pairs and
-accumulates a trajectory.
-
-```bash
-./build/gcvo_run_pcd \
-  --params gcvo_params/test.yaml \
-  --pcd_dir /path/to/pcds/ \
-  --type intensity \
-  --traj_file traj.txt        # KITTI format (12 floats per line, 3x4 row-major)
-```
-
-### KITTI frame-to-frame odometry
-
-```bash
-./build/gcvo_kitti_f2f \
-  --params gcvo_params/gcvo_driving_nonisotropic_gn.yaml \
-  --kitti_root /path/to/kitti/dataset \
-  --sequence 09 --start 0 --count 10000 \
-  --traj_file kitti_09.txt \
-  --voxel_mode fast          # pcl (default), fast (VoxelMapFirstPoint), or none
-```
-
-**Options:**
+## KITTI f2f options reference
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -121,9 +204,15 @@ accumulates a trajectory.
 | `--start` | `0` | First frame index |
 | `--count` | `10` | Number of frames to process |
 | `--traj_file` | | Output trajectory file (KITTI 12-float format) |
-| `--voxel_mode` | `pcl` | `pcl`, `fast` (VoxelMapFirstPoint), or `none` (skip voxel) |
-| `--random_downsample` | `0` (off) | Randomly subsample to N points (applied after voxel, or alone if `--voxel_mode none`) |
+| `--voxel_mode` | `pcl` | `pcl` (PCL VoxelGrid), `fast` (first-point-in-voxel), `centroid` (closest-to-running-mean, recommended), `voxel_random` (reservoir-sampled), or `none` |
+| `--voxel_size` | `0.25` | Voxel cell size in meters (used by `fast`, `centroid`, `voxel_random` modes) |
+| `--random_downsample` | `0` (off) | Randomly subsample to N points (applied after voxel) |
 | `--max_iter` | `10000` | Override max GN iterations from YAML |
+| `--first_frame_l_init` | `0.0` (off) | If `>0`, use this coarser `l_init` (with `ℓ²·I` enabled) for the first pair only — escapes the local minimum from identity initialization |
+| `--cov_eig_rescale P T` | off | RKHS_BA-style eigenvalue rescaling, `plane_thresh=P`, `tangent_thresh=T` (typical KITTI: `0.1 100`) |
+| `--identity_init` | off | Reset init to identity every frame (disables warm-start; diagnostic only) |
+| `--kitti_vert_calib_deg` | `0.0` (off) | Per-point Velodyne HDL-64E vertical-angle correction (degrees). Set to `0.205` to match RKHS_BA's `KittiHandler` |
+| `--init_row "r00,r01,...,r23"` | identity | Override the first-pair init transform (12 floats, 3×4 row-major). Lets you replay a frame with an arbitrary warm-start |
 | `--visualize` | off | Live point-cloud viewer (requires `-DGCVO_BUILD_VIZ=ON`) |
 
 For real-time computation, combine voxel + random downsampling with a tight iteration cap:
@@ -137,6 +226,34 @@ For real-time computation, combine voxel + random downsampling with a tight iter
   --random_downsample 4000 \
   --max_iter 40
 ```
+
+For best benchmark accuracy, use the full production config:
+```bash
+./build/gcvo_kitti_f2f \
+  --params gcvo_params/cf_B_eigclamp.yaml \
+  --kitti_root /path/to/kitti/dataset \
+  --sequence 05 --start 0 --count 999999 \
+  --voxel_mode centroid --voxel_size 0.25 \
+  --first_frame_l_init 1.0 \
+  --kitti_vert_calib_deg 0.205 \
+  --traj_file kitti_05.kitti
+```
+
+### YAML parameter highlights
+
+The production `cf_B_eigclamp.yaml` adds three GCVO-specific knobs on top of the
+classic RKHS_BA params:
+
+| YAML key | Default | Description |
+|----------|---------|-------------|
+| `cov_eig_min` | `0.0` (off) | Clamp per-point covariance eigenvalues to this minimum. Critical floor that prevents `(Σ_a + Σ_b)^{-1}` from blowing up when KNN gives a near-degenerate Σ. KITTI prod uses `0.01`. |
+| `cov_eig_max` | `0.0` (off) | Clamp per-point covariance eigenvalues to this maximum. KITTI prod uses `10.0`. |
+| `use_ell2_in_kernel` | `1` | Add `ℓ²·I` regularization inside `(Σ_a + Σ_b + ℓ²I)^{-1}`. Set `0` for sharp anisotropic matching (KITTI prod); set `1` to soften (helps low-texture or sparse-overlap pairs). |
+| `use_connection_term` | `1` | Include the SE(3) Christoffel correction in the curvature matrix. `0` disables, `1` subtracts (correct), `2` adds (diverges — diagnostic only). |
+| `use_symmetrization` | `1` | Symmetrize `B_gn` before LDLT. `0` is usually better in practice. |
+| `use_h1_term`, `use_h2_term`, `use_h3_term` | `0` | Optional exact-Hessian correction terms. H4 (Gauss-Newton) is always active. On KITTI, none of H1/H2/H3 measurably improve the benchmark; H1 destabilizes the solver on several sequences. |
+| `kernel_euclidean_max_dist` | `inf` | Pre-filter neighbors farther than this Euclidean distance². Set to `1.0` (1 m) on dense scenes to cap kernel cost. |
+
 
 ## Repository layout
 ```
@@ -162,8 +279,8 @@ gcvo/
   third_party/            Vendored CUDA KD-tree from RKHS-BA
 gcvo_params/               Example YAML parameter files
 demo_data/                Sample PCD files (bunny.pcd)
-scripts/                  Shell helpers
-rkhs_ba/                  Upstream code from RKHS_BA, as a git submodule. 
+scripts/                  Shell helpers for running demos
+rkhs_ba/                  Upstream code from RKHS_BA, as a git submodule.
 ```
 
 
@@ -190,7 +307,6 @@ template void gcvo::GCvoPointCloudT<gcvo::PointS1>::compute_covariance(float, fl
 This produces one static library per point type (`gcvo_s1`, `gcvo_s3`, etc.).
 Your application code includes only the CUDA-free public headers and links
 against the type(s) it needs -- no NVCC required for application code.
-
 
 
 
@@ -567,21 +683,6 @@ This repo's license is in the root `LICENSE` file.
 
 Contact (GCVO modifications): ray.zhang@tri.global
 
-GCVO PROVENANCE NOTICE (derived from RKHS_BA, MIT license)
-Portions of this file are derived from RKHS_BA (MIT): https://github.com/UMich-CURLY/RKHS_BA
-Upstream is included in this repo as a git submodule at: rkhs_ba/
-Upstream file: N/A (no 1:1 mapping claimed)
-
-This GCVO repository is NOT a verbatim copy of RKHS_BA. It includes substantial modifications,
-refactors, and additional original content (e.g., solver/optimization changes and new utilities).
-
-References:
-- RKHS_BA paper: R. Zhang et al., IEEE TPAMI 2025, doi: 10.1109/TPAMI.2025.3593521
-- GCVO paper: R. Zhang et al., CVPR 2026 (see repo README for details)
-
-License: RKHS_BA is MIT-licensed (see rkhs_ba/ for the upstream LICENSE). This repo’s license is in
-the root LICENSE file. Contact (GCVO modifications): ray.zhang@tri.global
-
 ### Citations
 If you find this work useful, please cite
 ```
@@ -592,4 +693,3 @@ If you find this work useful, please cite
   year      = {2026}
 }
 ```
-

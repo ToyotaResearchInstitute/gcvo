@@ -1,0 +1,28 @@
+%YAML:1.0
+---
+# ETH3D: l_init=0.25 WITHOUT ell2 (control for isolating ell2 effect).
+l_init: 0.25
+l_min: 0.05
+amplitude: 0.1
+sparsity_cutoff: 0.0001
+c_l: 0.1
+c_amplitude: 1
+max_iterations: 500
+tol: 0.00005
+tol_2: 0.000012
+max_neighbors: 128
+l_decay_rate: 0.8
+l_decay_start: 10
+indicator_window: 10
+indicator_threshold: 0.0001
+use_geometry: 1
+use_features: 1
+kernel_type: 1
+kernel_eval_max_dist: 0.25
+neighbor_decay: 1
+verbose: 0
+use_symmetrization: 0
+use_connection_term: 1
+use_ell2_in_kernel: 0
+cov_eig_min: 0.001
+cov_eig_max: 1.0
