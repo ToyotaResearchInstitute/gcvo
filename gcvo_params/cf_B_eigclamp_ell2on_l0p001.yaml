@@ -1,0 +1,27 @@
+%YAML:1.0
+---
+l_init: 0.001
+l_min: 0.001
+amplitude: 0.1
+sparsity_cutoff: 0.0001
+c_l: 0.05
+c_amplitude: 1
+max_iterations: 100
+tol: 0.00005
+tol_2: 0.000012
+max_neighbors: 128
+l_decay_rate: 0.7
+l_decay_start: 60
+indicator_window: 30
+indicator_threshold: 0.001
+use_geometry: 1
+use_features: 1
+kernel_type: 1
+kernel_eval_max_dist: 100
+neighbor_decay: 1
+verbose: 0
+use_symmetrization: 0
+use_connection_term: 1
+use_ell2_in_kernel: 1
+cov_eig_min: 0.01
+cov_eig_max: 10.0
