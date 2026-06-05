@@ -40,6 +40,8 @@
 #include "gcvo/utils/PointTypes19.hpp"
 #include "gcvo/utils/VoxelMapFirstPoint.hpp"
 #include "gcvo/utils/VoxelMapFirstPoint_impl.hpp"
+#include "gcvo/utils/VoxelMapClosestToCentroid.hpp"
+#include "gcvo/utils/VoxelMapRandomPoint.hpp"
 
 #ifdef GCVO_USE_VIZ
 #  include "gcvo/utils/MapViewer.hpp"
@@ -77,6 +79,21 @@ struct Args {
   std::string voxel_mode = "pcl"; // "pcl", "fast", or "none"
   int random_downsample = 0;      // 0 = disabled; >0 = target number of points
   int max_iter = 10000;           // overrides yaml max_iterations
+  float first_frame_l_init = 0.0f; // if >0, override l_init for the first frame only
+  // Eigenvalue rescaling (RKHS_BA-style) — applied after compute_covariance().
+  // Off when plane_thresh <= 0.
+  float cov_plane_thresh = 0.0f;
+  float cov_tangent_thresh = 0.0f;
+  // Diagnostic: if true, reset init to identity for every frame (disables warm-start).
+  bool identity_init = false;
+  // Voxel cell size in meters (used by 'fast' and 'centroid' modes).
+  float voxel_size = 0.25f;
+  // Apply per-point intrinsic calibration (Velodyne HDL-64E vertical angle offset).
+  // RKHS_BA uses 0.205°. Set 0 to disable.
+  float kitti_vertical_angle_offset_deg = 0.0f;
+  // If set, override the first-pair init (3x4 row-major, 12 comma-separated floats).
+  // Lets us replay a frame with an arbitrary warm-start (e.g., from a prior failed run).
+  std::string init_row_str;
 };
 
 static void print_usage(const char* argv0) {
@@ -86,11 +103,15 @@ static void print_usage(const char* argv0) {
       << " --params <params.yaml> --kitti_root <KITTI_ODOM_ROOT>"
          " [--sequence 00] [--start 0] [--count 10]"
          " [--traj_file <out.txt>] [--visualize] [--voxel_mode pcl|fast|none]"
-         " [--random_downsample <N>] [--max_iter <N>]\n\n"
+         " [--random_downsample <N>] [--max_iter <N>] [--first_frame_l_init <l>]\n\n"
       << "Reads velodyne/*.bin and runs frame-to-frame registration using PointS1 (XYZI).\n"
-      << "--voxel_mode: 'pcl' (default), 'fast', or 'none' to skip voxel downsampling.\n"
+      << "--voxel_mode: 'pcl' (default), 'fast' (first-point), 'centroid' (closest to running mean),\n"
+      << "               'voxel_random' (reservoir-sampled point), or 'none'.\n"
       << "--random_downsample N: randomly subsample to N points (applied after voxel, or alone if voxel_mode=none).\n"
       << "--max_iter N: override max iterations from YAML (default 10000).\n"
+      << "--first_frame_l_init L: use l_init=L for the first pair only (identity init; 0=disabled).\n"
+      << "--cov_eig_rescale P T: RKHS_BA eigenvalue rescaling, plane_thresh=P, tangent_thresh=T\n"
+      << "                       (typical KITTI: 0.1 100). 0=disabled.\n"
       << "--visualize requires building with -DGCVO_BUILD_VIZ=ON.\n";
 }
 
@@ -114,6 +135,17 @@ static bool parse_args(int argc, char** argv, Args& a) {
     else if (k == "--voxel_mode") a.voxel_mode = need("--voxel_mode");
     else if (k == "--random_downsample") a.random_downsample = std::stoi(need("--random_downsample"));
     else if (k == "--max_iter") a.max_iter = std::stoi(need("--max_iter"));
+    else if (k == "--first_frame_l_init") a.first_frame_l_init = std::stof(need("--first_frame_l_init"));
+    else if (k == "--cov_eig_rescale") {
+      a.cov_plane_thresh   = std::stof(need("--cov_eig_rescale (plane_thresh)"));
+      a.cov_tangent_thresh = std::stof(need("--cov_eig_rescale (tangent_thresh)"));
+    }
+    else if (k == "--identity_init") a.identity_init = true;
+    else if (k == "--voxel_size") a.voxel_size = std::stof(need("--voxel_size"));
+    else if (k == "--kitti_vert_calib_deg")
+      a.kitti_vertical_angle_offset_deg = std::stof(need("--kitti_vert_calib_deg"));
+    else if (k == "--init_row")
+      a.init_row_str = need("--init_row");
     else if (k == "-h" || k == "--help") return false;
     else {
       std::cerr << "Unknown arg: " << k << "\n";
@@ -130,7 +162,8 @@ static std::string kitti_bin_path(const Args& a, int frame) {
   return ss.str();
 }
 
-static pcl::PointCloud<pcl::PointXYZI>::Ptr load_kitti_bin_raw(const std::string& path) {
+static pcl::PointCloud<pcl::PointXYZI>::Ptr load_kitti_bin_raw(
+    const std::string& path, float vertical_angle_offset_deg = 0.0f) {
   std::ifstream ifs(path, std::ios::binary);
   if (!ifs) {
     throw std::runtime_error("Failed to open " + path);
@@ -146,19 +179,36 @@ static pcl::PointCloud<pcl::PointXYZI>::Ptr load_kitti_bin_raw(const std::string
   auto ptr = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
   ptr->resize(npts);
 
+  const float vert_rad = vertical_angle_offset_deg * static_cast<float>(M_PI) / 180.0f;
+  const bool apply_calib = std::fabs(vertical_angle_offset_deg) > 1e-6f;
+  const Eigen::Vector3f uz(0.0f, 0.0f, 1.0f);
+
   for (size_t i = 0; i < npts; ++i) {
     float x, y, z, r;
     ifs.read(reinterpret_cast<char*>(&x), sizeof(float));
     ifs.read(reinterpret_cast<char*>(&y), sizeof(float));
     ifs.read(reinterpret_cast<char*>(&z), sizeof(float));
     ifs.read(reinterpret_cast<char*>(&r), sizeof(float));
+
+    // Per-point Velodyne HDL-64E intrinsic calibration: rotate each point by
+    // vert_rad around an axis perpendicular to (p, z_world). Matches RKHS_BA's
+    // KittiHandler::read_next_lidar (0.205° default).
+    if (apply_calib) {
+      Eigen::Vector3f p(x, y, z);
+      Eigen::Vector3f axis = p.cross(uz);
+      const float axis_norm = axis.norm();
+      if (axis_norm > 1e-8f) {
+        axis /= axis_norm;
+        Eigen::Matrix3f R = Eigen::AngleAxisf(vert_rad, axis).toRotationMatrix();
+        p = R * p;
+        x = p.x(); y = p.y(); z = p.z();
+      }
+    }
+
     (*ptr)[i].x = x;
     (*ptr)[i].y = y;
     (*ptr)[i].z = z;
-    (*ptr)[i].intensity = r * 255.0f;  // store in [0,255] so GCvoPointCloudT maps to features[0] in [0,1]
-    if (i == 1) {
-      std::cout<<" raw intensity = "<<r<<", p.intensity is "<<(*ptr)[i].intensity<<"\n";
-    }
+    (*ptr)[i].intensity = r * 255.0f;  // GCvoPointCloud ctor divides by 255 → features[0] ∈ [0,1] in kernel.
   }
   return ptr;
 }
@@ -176,6 +226,33 @@ static pcl::PointCloud<pcl::PointXYZI> downsample(
 static pcl::PointCloud<pcl::PointXYZI> downsample_fast(
     pcl::PointCloud<pcl::PointXYZI>& raw, float voxel_size = 0.25f) {
   cvo::VoxelMapFirstPoint<pcl::PointXYZI> vmap(voxel_size);
+  for (auto& p : raw) vmap.insert_point(&p);
+  auto sampled = vmap.sample_points();
+  pcl::PointCloud<pcl::PointXYZI> out;
+  out.reserve(sampled.size());
+  for (auto* p : sampled) out.push_back(*p);
+  return out;
+}
+
+// Voxel downsample using "closest to running centroid" representative.
+// Incrementally tracks each voxel's centroid and keeps the point with min
+// |pt - centroid|² as the cell's representative. See VoxelMapClosestToCentroid.hpp.
+static pcl::PointCloud<pcl::PointXYZI> downsample_centroid(
+    pcl::PointCloud<pcl::PointXYZI>& raw, float voxel_size = 0.25f) {
+  cvo::VoxelMapClosestToCentroid<pcl::PointXYZI> vmap(voxel_size);
+  for (auto& p : raw) vmap.insert_point(&p);
+  auto sampled = vmap.sample_points();
+  pcl::PointCloud<pcl::PointXYZI> out;
+  out.reserve(sampled.size());
+  for (auto* p : sampled) out.push_back(*p);
+  return out;
+}
+
+// Voxel downsample using uniformly random point from each cell via incremental
+// reservoir sampling (size 1). See VoxelMapRandomPoint.hpp.
+static pcl::PointCloud<pcl::PointXYZI> downsample_voxel_random(
+    pcl::PointCloud<pcl::PointXYZI>& raw, float voxel_size = 0.25f) {
+  cvo::VoxelMapRandomPoint<pcl::PointXYZI> vmap(voxel_size);
   for (auto& p : raw) vmap.insert_point(&p);
   auto sampled = vmap.sample_points();
   pcl::PointCloud<pcl::PointXYZI> out;
@@ -239,6 +316,8 @@ int main(int argc, char** argv) {
   try {
     gcvo::GCvoGPU<gcvo::PointS1> solver(a.params);
     solver.params().max_iterations = a.max_iter;
+    const float orig_l_init = solver.params().l_init;
+    const int   orig_use_ell2 = solver.params().use_ell2_in_kernel;
 
     std::ofstream traj_ofs;
     if (!a.traj_file.empty()) {
@@ -262,6 +341,21 @@ int main(int argc, char** argv) {
     //   T_0_{i+1} = T_0_i * T_i_{i+1}
     Eigen::Matrix4f T_0_i = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f init = Eigen::Matrix4f::Identity();
+    if (!a.init_row_str.empty()) {
+      std::vector<float> vals;
+      std::string s = a.init_row_str;
+      for (char& c : s) if (c == ',') c = ' ';
+      std::istringstream iss(s);
+      float v;
+      while (iss >> v) vals.push_back(v);
+      if (vals.size() != 12) {
+        throw std::runtime_error("--init_row needs 12 floats (3x4 row-major), got "
+                                 + std::to_string(vals.size()));
+      }
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+          init(r, c) = vals[r * 4 + c];
+    }
 
     const bool need_cov = (static_cast<int>(solver.params().kernel_type) != 0);
     const bool is_rescaled = (solver.params().kernel_type == gcvo::GCvoKernelType::RESCALED);
@@ -286,8 +380,8 @@ int main(int argc, char** argv) {
       }
 
       // IO: read raw point clouds from disk (not timed).
-      auto raw0 = load_kitti_bin_raw(p0);
-      auto raw1 = load_kitti_bin_raw(p1);
+      auto raw0 = load_kitti_bin_raw(p0, a.kitti_vertical_angle_offset_deg);
+      auto raw1 = load_kitti_bin_raw(p1, a.kitti_vertical_angle_offset_deg);
 
       // --- Start timing: downsample + covariance + align ---
       const auto t_start = std::chrono::steady_clock::now();
@@ -298,8 +392,14 @@ int main(int argc, char** argv) {
         pc0 = *raw0;
         pc1 = *raw1;
       } else if (a.voxel_mode == "fast") {
-        pc0 = downsample_fast(*raw0);
-        pc1 = downsample_fast(*raw1);
+        pc0 = downsample_fast(*raw0, a.voxel_size);
+        pc1 = downsample_fast(*raw1, a.voxel_size);
+      } else if (a.voxel_mode == "centroid") {
+        pc0 = downsample_centroid(*raw0, a.voxel_size);
+        pc1 = downsample_centroid(*raw1, a.voxel_size);
+      } else if (a.voxel_mode == "voxel_random") {
+        pc0 = downsample_voxel_random(*raw0, a.voxel_size);
+        pc1 = downsample_voxel_random(*raw1, a.voxel_size);
       } else {
         pc0 = downsample(raw0);
         pc1 = downsample(raw1);
@@ -314,9 +414,32 @@ int main(int argc, char** argv) {
       if (need_cov) {
         src.compute_covariance(0.1f, 100.0f, 12, 8, is_rescaled, true);
         tgt.compute_covariance(0.1f, 100.0f, 12, 8, is_rescaled, true);
+        if (a.cov_plane_thresh > 0.0f && a.cov_tangent_thresh > 0.0f) {
+          src.rescale_covariance_eigenvalues_rkhs(a.cov_plane_thresh, a.cov_tangent_thresh);
+          tgt.rescale_covariance_eigenvalues_rkhs(a.cov_plane_thresh, a.cov_tangent_thresh);
+        }
       }
 
-      gcvo::GCvoResultInfo r = solver.align(src, tgt, init, false);
+      // First-frame override: use a coarser l_init for the identity-initialized pair.
+      // With --identity_init, every frame uses the "first frame" l_init since each
+      // alignment starts from identity (no warm start).
+      //
+      // Additionally: when the first-frame override is active, force
+      // use_ell2_in_kernel=1 for that frame (the kernel uses (Σ+ℓ²I)⁻¹ with
+      // ℓ²=first_frame_l_init² to soften it and escape local minima). For later
+      // warm-started frames, restore the YAML setting (typically ℓ²=0 for sharp
+      // surface alignment).
+      if (a.first_frame_l_init > 0.0f) {
+        gcvo::GCvoParams p = solver.params();
+        const bool is_first = (f == a.start || a.identity_init);
+        p.l_init = is_first ? a.first_frame_l_init : orig_l_init;
+        p.use_ell2_in_kernel = is_first ? 1 : orig_use_ell2;
+        solver.write_params(p);
+      }
+
+      const Eigen::Matrix4f init_to_use = a.identity_init
+          ? Eigen::Matrix4f::Identity() : init;
+      gcvo::GCvoResultInfo r = solver.align(src, tgt, init_to_use, false);
 
       const auto t_end = std::chrono::steady_clock::now();
       const double total_sec = std::chrono::duration<double>(t_end - t_start).count();

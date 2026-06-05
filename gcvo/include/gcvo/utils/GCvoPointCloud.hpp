@@ -182,6 +182,78 @@ public:
                           bool is_rescaled_kernel = false,
                           bool use_kdtree = true);
 
+  /// Clamp per-point covariance eigenvalues to [min_eig, max_eig] and reconstruct.
+  ///
+  /// Call after compute_covariance() when using DENSE/RESCALED kernels.
+  /// Ensures all eigenvalues are in [min_eig, max_eig] (max_eig <= 0 means no upper clamp).
+  /// When paired with use_ell2_in_kernel=0, the clamped covariance fully controls kernel shape.
+  void clamp_covariance_eigenvalues(float min_eig, float max_eig) {
+    if constexpr (!detail::has_covariance<PointT>::value) return;
+    for (auto& p : points_) {
+      Eigen::Map<Eigen::Matrix<float, 3, 3, Eigen::RowMajor>> cov(p.covariance);
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+      Eigen::Vector3f eigs = es.eigenvalues().cwiseMax(min_eig);
+      if (max_eig > 0.0f) eigs = eigs.cwiseMin(max_eig);
+      cov = (es.eigenvectors() * eigs.asDiagonal() * es.eigenvectors().transpose()).eval();
+    }
+  }
+
+  /// Rescale covariance eigenvalues — RKHS_BA-compatible.
+  ///
+  /// Call AFTER compute_covariance() to apply the eigenvalue rescaling used in
+  /// RKHS_BA's `init_covariance_single_thread` (CvoPointCovariance.cuh). This is
+  /// fundamentally different from `clamp_covariance_eigenvalues`:
+  ///
+  ///   1. If max_eigenvalue < plane_thresh: linearly rescale all eigenvalues so
+  ///      that (max_eval-min_eval) maps to (tangent_thresh-plane_thresh).
+  ///   2. Then clamp: small → plane_thresh (normal direction floor),
+  ///                  large → tangent_thresh (tangent direction ceiling),
+  ///                  middle → linear interp in [plane_thresh, tangent_thresh].
+  ///   3. Reconstruct cov = V · diag(rescaled) · V^T.
+  ///
+  /// This bounds the condition number of the covariance, regularizes
+  /// near-degenerate eigenvalues, and produces consistent anisotropy across
+  /// LiDAR scans regardless of absolute covariance scale (which varies with range).
+  ///
+  /// Typical KITTI driving thresholds: plane_thresh=0.1, tangent_thresh=100.0.
+  void rescale_covariance_eigenvalues_rkhs(float plane_eigenvalue_thresh,
+                                            float tangent_eigenvalue_thresh) {
+    if constexpr (!detail::has_covariance<PointT>::value) return;
+    for (auto& p : points_) {
+      Eigen::Map<Eigen::Matrix<float, 3, 3, Eigen::RowMajor>> cov(p.covariance);
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+      Eigen::Vector3f eigs = es.eigenvalues();   // ascending order
+      const float min_eval = eigs.minCoeff();
+      const float max_eval = eigs.maxCoeff();
+
+      float max_scale = 1.0f;
+      if (max_eval < plane_eigenvalue_thresh && (max_eval - min_eval) > 1e-8f) {
+        max_scale = (tangent_eigenvalue_thresh - plane_eigenvalue_thresh)
+                    / (max_eval - min_eval);
+      }
+
+      Eigen::Vector3f rescaled;
+      for (int j = 0; j < 3; ++j) {
+        const float v = eigs(j) * max_scale;
+        if (v < plane_eigenvalue_thresh) {
+          rescaled(j) = plane_eigenvalue_thresh;
+        } else if (v > tangent_eigenvalue_thresh) {
+          rescaled(j) = tangent_eigenvalue_thresh;
+        } else {
+          rescaled(j) = (eigs(j) - min_eval) * max_scale + plane_eigenvalue_thresh;
+        }
+      }
+
+      cov = (es.eigenvectors() * rescaled.asDiagonal() * es.eigenvectors().transpose()).eval();
+
+      if constexpr (detail::has_normal<PointT>::value) {
+        // Normal = smallest-eigenvalue eigenvector (first column for ascending order).
+        Eigen::Vector3f n = es.eigenvectors().col(0).normalized();
+        p.normal[0] = n.x(); p.normal[1] = n.y(); p.normal[2] = n.z();
+      }
+    }
+  }
+
   /// Apply a rigid transform to @p input and write the result to @p output.
   ///
   /// Transforms xyz by T. If PointT has normal[], rotates normals (no

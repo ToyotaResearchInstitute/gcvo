@@ -132,10 +132,8 @@ __global__ void compute_covariance_knn_kernel(PointT* points,
   c12 *= denom;
   c22 *= denom;
 
-  const float reg = 1e-6f;
-  c00 += reg;
-  c11 += reg;
-  c22 += reg;
+  // Exp D: NO diagonal regularization (was +1e-6 on c00, c11, c22)
+  // Match RKHS_BA which doesn't add diagonal reg.
 
   pi.covariance[0] = c00;
   pi.covariance[1] = c01;

@@ -259,7 +259,11 @@ __global__ void compute_correlation_kernel(const GCvoParams* params,
             || d2 / l2  > d2_thres) continue;
         w_geo = amplitude2 * expf(-d2 / (2.0f * l2));
       } else {
-        const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_l2I(p.covariance, q.covariance, l2);
+        // Cheap Euclidean pre-filter before the expensive cov_inv computation.
+        const float eucl_d2 = squared_dist_xyz(p, q);
+        if (eucl_d2 > params->kernel_euclidean_max_dist) continue;
+        const float effective_l2 = params->use_ell2_in_kernel ? l2 : 0.0f;
+        const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_l2I(p.covariance, q.covariance, effective_l2);
         Eigen::Vector3f dp(p.x - q.x, p.y - q.y, p.z - q.z);
         const float d2 = dp.dot(cov_inv * dp);
         if (!isfinite(d2) || d2 > params->kernel_eval_max_dist
@@ -326,14 +330,56 @@ __global__ void compute_hessian_gn_kernel(const GCvoParams* params,
     J.block<3, 3>(0, 0) = -skew_y;
     J.block<3, 3>(0, 3) = Eigen::Matrix3f::Identity();
 
+    Eigen::Vector3f Sr;
     if (!use_covariance) {
       const float w = l2_inv;
       Hi.noalias() += w_ij * (J.transpose() * w * J);
       gi.noalias() += w_ij * (J.transpose() * w * r);
+      Sr = r * l2_inv;
     } else {
       const Eigen::Matrix3f cov_inv = cov_sum_inv_plus_l2I(px.covariance, py.covariance, l2);
       Hi.noalias() += w_ij * (J.transpose() * cov_inv * J);
       gi.noalias() += w_ij * (J.transpose() * cov_inv * r);
+      Sr = cov_inv * r;
+
+      // H3: f·J^T·D(S)[ξ]·r — covariance-derivative term (DENSE/RESCALED only).
+      // D(S)[ξ] acting on r via the chain: S = (Σ_x + R·Σ_y·R^T + l²I)^{-1},
+      // Linearize in ξ=(ω,v): D(R·Σ_y·R^T)[ξ] = [ω,Σ_y]_rot, giving
+      // D(S)[ξ]·r = -S·D(Σ_sum)[ξ]·S·r = -S·([ω^∧,Σ_y]·Sr) = -S·(ω^∧·Σ_y·Sr - Σ_y·ω^∧·Sr)
+      // Per pair: top 3 of J^T is -y^∧, bot 3 is I. J^T·D(S)[ξ]·r has shape (6,1) acting on ξ.
+      // Collecting the (6×6) matrix contribution:
+      if (params->use_h3_term) {
+        Eigen::Map<const Eigen::Matrix<float,3,3,Eigen::RowMajor>> Sigma_y(py.covariance);
+        const Eigen::Vector3f Sy_Sr = Sigma_y * Sr;
+        // M3 = skew(Σ_y·Sr) - Σ_y·skew(Sr)  [3x3, multiplied by ω on the right]
+        const Eigen::Matrix3f M3 = skew3(Sy_Sr) - Sigma_y * skew3(Sr);
+        const Eigen::Matrix3f S_M3 = cov_inv * M3;  // [3x3]
+        // J^T top 3: -y^∧,  bot 3: I
+        Hi.template block<3,3>(0,0).noalias() -= w_ij * skew_y * S_M3;
+        Hi.template block<3,3>(3,0).noalias() -= w_ij * S_M3;
+      }
+    }
+
+    // H2: f·D(J^T)[ξ]·S·r — Jacobian-derivative term (all kernel types).
+    // D(J^T)[ξ]·Sr has top-3 = skew(Sr)^T·ξ_ω term, giving per-pair (6×6):
+    //   top-left  = (Sr·y)·I - y·Sr^T   [acts on ω]
+    //   top-right = skew(Sr)             [acts on v]
+    //   bot rows  = 0
+    if (params->use_h2_term) {
+      const float sr_dot_y = Sr.dot(y);
+      const Eigen::Matrix3f tl = sr_dot_y * Eigen::Matrix3f::Identity() - y * Sr.transpose();
+      const Eigen::Matrix3f tr = skew3(Sr);
+      Hi.template block<3,3>(0,0).noalias() += w_ij * tl;
+      Hi.template block<3,3>(0,3).noalias() += w_ij * tr;
+    }
+
+    // H1: -f·(J^T·S·r)·(J^T·S·r)^T — kernel-weight-derivative term (all kernel types).
+    // J^T·S·r = [y^∧·Sr; Sr]  (6-vector).
+    if (params->use_h1_term) {
+      Eigen::Matrix<float,6,1> JtSr;
+      JtSr.template head<3>() = skew_y * Sr;
+      JtSr.template tail<3>() = Sr;
+      Hi.noalias() -= w_ij * (JtSr * JtSr.transpose());
     }
   }
 
@@ -604,10 +650,17 @@ static Eigen::Matrix<float, 6, 1> compute_gn_update(const GCvoParams& params_cpu
   if (H_out) *H_out = H;
   if (g_out) *g_out = g;
 
-  // Optional connection term: adds an antisymmetric correction to the Hessian.
+  // We maximize f(T) = RKHS inner product.
+  // g  = -grad_f = sum_ij w_ij J^T S r   (accumulated by the kernel above)
+  // H  = B_gn   = sum_ij w_ij J^T S J    (positive ascent curvature, approx -Hess f)
+  // Step: dx = B_gn^{-1} grad_f
+  const Vec6 grad_f = -g;
+
+  // Connection term: B_gn += sym(Gamma(grad_f)).
+  // Built from grad_f so the sign matches the maximization update.
   Mat66 Hmod = H;
-  const Eigen::Vector3f gw = g.template head<3>();
-  const Eigen::Vector3f gv = g.template tail<3>();
+  const Eigen::Vector3f gw = grad_f.template head<3>();
+  const Eigen::Vector3f gv = grad_f.template tail<3>();
   const Eigen::Matrix3f gw_skew = skew3(gw);
   const Eigen::Matrix3f gv_skew = skew3(gv);
 
@@ -615,12 +668,18 @@ static Eigen::Matrix<float, 6, 1> compute_gn_update(const GCvoParams& params_cpu
   gamma.template block<3,3>(0,0) = -0.5f * gw_skew;
   gamma.template block<3,3>(3,0) = -gv_skew;
 
-  Hmod = (Hmod + gamma.transpose()).eval();
+  // use_connection_term: 0=off, 1=subtract gamma^T (default), 2=add gamma^T
+  if (params_cpu.use_connection_term == 1)
+    Hmod = (Hmod - gamma.transpose()).eval();
+  else if (params_cpu.use_connection_term == 2)
+    Hmod = (Hmod + gamma.transpose()).eval();
 
-  // GN solve: dx = -H^{-1} Jr
-  const Mat66 Hsym = 0.5f * (Hmod + Hmod.transpose());
+  // GN solve: dx = B_gn^{-1} grad_f
+  const Mat66 Hsym = params_cpu.use_symmetrization
+                       ? (0.5f * (Hmod + Hmod.transpose())).eval()
+                       : Hmod;
   Eigen::LDLT<Mat66> ldlt(Hsym);
-  Vec6 dx = -ldlt.solve(g);
+  Vec6 dx = ldlt.solve(grad_f);
   if (!dx.array().isFinite().all()) {
     dx.setZero();
   }
@@ -642,8 +701,17 @@ int GCvoGPU<PointT>::align(const PointCloud& source,
     return -1;
   }
 
-  auto fixed_gpu = pointcloud_to_gpu<PointT>(source);
-  auto moving_gpu = pointcloud_to_gpu<PointT>(target);
+  // Apply eigenvalue clamping if requested. Work on mutable copies so the
+  // caller's clouds are unchanged; when disabled (both fields 0) skip the copy.
+  const bool do_eig_clamp = (params_.cov_eig_min > 0.0f || params_.cov_eig_max > 0.0f);
+  auto fixed_gpu  = do_eig_clamp
+    ? [&]{ auto c = source; c.clamp_covariance_eigenvalues(params_.cov_eig_min, params_.cov_eig_max);
+           return pointcloud_to_gpu<PointT>(c); }()
+    : pointcloud_to_gpu<PointT>(source);
+  auto moving_gpu = do_eig_clamp
+    ? [&]{ auto c = target; c.clamp_covariance_eigenvalues(params_.cov_eig_min, params_.cov_eig_max);
+           return pointcloud_to_gpu<PointT>(c); }()
+    : pointcloud_to_gpu<PointT>(target);
 
   GCvoParams params_align = params_;
   GCvoStateT<PointT> state(fixed_gpu, moving_gpu, params_align);
@@ -759,8 +827,10 @@ int GCvoGPU<PointT>::align(const PointCloud& source,
       std::cout << "[gcvo][debug] dist = " << dx_norm << "\n";
     }
 
-    // Optionally decay l for SCALAR kernel
-    if (params_align.kernel_type == GCvoKernelType::SCALAR) {
+    // Decay l for all kernel types (matches RKHS_BA's CvoGPU.cu line 2310).
+    // For DENSE/RESCALED, l enters the kernel via the ℓ²·I regularization in
+    // cov_sum_inv_plus_l2I, so decaying l progressively tightens the kernel.
+    {
       const float corr_indicator = correlation_sum_device(state.corr_host, k);
       bool decay = false;
       if (params_align.use_ema_indicator) {

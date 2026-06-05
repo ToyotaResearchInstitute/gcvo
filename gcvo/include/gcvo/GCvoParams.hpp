@@ -92,6 +92,39 @@ namespace gcvo {
     /// 0 = disabled (fixed k), 1 = enabled.
     int neighbor_decay;
 
+    /// Add the SE(3) connection-term correction to the GN curvature matrix (default 1).
+    int use_connection_term;
+
+    /// Symmetrize the GN curvature matrix before LDLT solve (default 1).
+    int use_symmetrization;
+
+    /// Clamp per-point covariance eigenvalues to >= this value (0 = disabled, default 0).
+    float cov_eig_min;
+
+    /// Clamp per-point covariance eigenvalues to <= this value (0 = disabled, default 0).
+    float cov_eig_max;
+
+    /// Include ℓ²·I regularization in cov_sum_inv_plus_l2I during kernel evaluation (default 1).
+    /// Set to 0 when eigenvalue clamping already ensures conditioning.
+    int use_ell2_in_kernel;
+
+    /// Euclidean squared-distance pre-filter for DENSE/RESCALED kernel evaluation (default inf).
+    /// Pairs with squared Euclidean distance > this are skipped before computing cov_inv.
+    /// E.g. set to 1.0 to ignore pairs more than 1 m apart.
+    float kernel_euclidean_max_dist;
+
+    /// Include H1 term -f·(J^T S r)(J^T S r)^T in curvature matrix (default 0).
+    /// Symmetric, neg-semidef; corrects for kernel weight variation.
+    int use_h1_term;
+
+    /// Include H2 term f·D(J^T)[ξ]·S·r in curvature matrix (default 0).
+    /// Non-symmetric; corrects for Jacobian variation (vanishes at convergence).
+    int use_h2_term;
+
+    /// Include H3 term f·J^T·D(S)[ξ]·r in curvature matrix (default 0).
+    /// Non-symmetric; corrects for covariance variation. Only active for DENSE/RESCALED.
+    int use_h3_term;
+
     GCvoParams()
       : l_init(0.5),
         l_min(0.05),
@@ -115,7 +148,16 @@ namespace gcvo {
         kernel_eval_max_dist(std::numeric_limits<float>::max()),
         verbose(0),
         use_ema_indicator(0),
-        neighbor_decay(0){}
+        neighbor_decay(0),
+        use_connection_term(1),
+        use_symmetrization(1),
+        cov_eig_min(0.0f),
+        cov_eig_max(0.0f),
+        use_ell2_in_kernel(1),
+        kernel_euclidean_max_dist(std::numeric_limits<float>::max()),
+        use_h1_term(0),
+        use_h2_term(0),
+        use_h3_term(0){}
   };
 
   /// Load GCvoParams from a YAML file, overwriting only the keys present.
@@ -155,6 +197,18 @@ namespace gcvo {
     if (fs["use_ema_indicator"]) params->use_ema_indicator = fs["use_ema_indicator"].as<int>();
 
     if (fs["neighbor_decay"]) params->neighbor_decay = fs["neighbor_decay"].as<int>();
+
+    if (fs["use_connection_term"]) params->use_connection_term = fs["use_connection_term"].as<int>();
+    if (fs["use_symmetrization"]) params->use_symmetrization = fs["use_symmetrization"].as<int>();
+
+    if (fs["cov_eig_min"]) params->cov_eig_min = fs["cov_eig_min"].as<float>();
+    if (fs["cov_eig_max"]) params->cov_eig_max = fs["cov_eig_max"].as<float>();
+    if (fs["use_ell2_in_kernel"]) params->use_ell2_in_kernel = fs["use_ell2_in_kernel"].as<int>();
+    if (fs["kernel_euclidean_max_dist"]) params->kernel_euclidean_max_dist = fs["kernel_euclidean_max_dist"].as<float>();
+
+    if (fs["use_h1_term"]) params->use_h1_term = fs["use_h1_term"].as<int>();
+    if (fs["use_h2_term"]) params->use_h2_term = fs["use_h2_term"].as<int>();
+    if (fs["use_h3_term"]) params->use_h3_term = fs["use_h3_term"].as<int>();
 
   }
 
