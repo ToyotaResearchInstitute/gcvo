@@ -1,7 +1,7 @@
 %YAML:1.0
 ---
-l_init: 0.1
-l_min: 0.05
+l_init: 0.01
+l_min: 0.01
 amplitude: 0.1
 sparsity_cutoff: 0.0001
 c_l: 0.05
@@ -22,6 +22,6 @@ neighbor_decay: 1
 verbose: 0
 use_symmetrization: 0
 use_connection_term: 1
-use_ell2_in_kernel: 0
+use_ell2_in_kernel: 1
 cov_eig_min: 0.01
 cov_eig_max: 10.0
