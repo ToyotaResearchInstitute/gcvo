@@ -1,3 +1,6 @@
 [submodule "rkhs_ba"]
 	path = rkhs_ba
 	url = https://github.com/UMich-CURLY/RKHS_BA
+[submodule "odometry_eval"]
+	path = odometry_eval
+	url = git@github.shared-services.aws.tri.global:driving/odometry_eval.git
