@@ -1,5 +1,14 @@
 # Generalized Continuous Visual Odometry (GCVO), a Header-only GPU Implementation
 
+<p align="center">
+  <img src="doc/figures/kitti_00_gcvo_2nd_order.png" alt="KITTI seq 00 — GCVO 2nd-order trajectory vs ground truth" width="48%">
+  <img src="doc/figures/eth3d_table_3_gcvo_2nd_order.png" alt="ETH3D table_3 sequence — GCVO 2nd-order tracking" width="48%">
+</p>
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=D7dJ3j6qx7g">▶ Demo video on YouTube</a>
+</p>
+
 A correspondence-free point-cloud registration that estimates a rigid SE(3) transform between two
 point clouds by **maximizing a kernelized inner product in a repoducible kernel Hilbert space (RKHS)** formulation.
 
@@ -84,13 +93,11 @@ Runs GCVO as frame-to-frame visual odometry on KITTI LiDAR sequences.
 Set `KITTI_ROOT` to wherever you downloaded the KITTI odometry dataset
 (the directory containing `sequences/`).
 
-#### Production config (best benchmark results)
-
-The production setup combines four ingredients:
-- `cf_B_eigclamp.yaml` — DENSE anisotropic kernel + per-point Σ eigenvalue clamping `[0.01, 10.0]`
-- `--voxel_mode centroid` — centroid-of-voxel downsampling (replaces first-point-in-voxel)
+Production setup:
+- `gcvo_params/cf_B_eigclamp.yaml` — DENSE anisotropic kernel + per-point Σ eigenvalue clamping
+- `--voxel_mode centroid` — closest-to-running-mean voxel downsampling
 - `--first_frame_l_init 1.0` — coarser kernel for the identity-initialized first pair
-- `--kitti_vert_calib_deg 0.205` — Velodyne HDL-64E intrinsic vertical-angle correction
+- `--kitti_vert_calib_deg 0.205` — Velodyne HDL-64E vertical-angle correction
 
 ```bash
 ./build/gcvo_kitti_f2f \
@@ -101,21 +108,6 @@ The production setup combines four ingredients:
   --first_frame_l_init 1.0 \
   --kitti_vert_calib_deg 0.205 \
   --traj_file kitti_05.kitti
-```
-
-This config achieves **mean t_rel = 1.345% ± 0.42** across all 11 KITTI sequences (00–10),
-beating both the no-calibration baseline (1.632%) and the RKHS_BA reference (1.389%).
-Per-sequence trajectories and full reproduction in
-`results/2026-06-01/kitti_eigclamp_calib_winner/`.
-
-#### Quick demo (legacy scripts)
-
-```bash
-# With connection term, loops over sequences 06, 08:
-scripts/run_kitti_f2f.sh
-
-# Without connection term, loops over sequences 06, 08:
-scripts/run_kitti_f2f_no_connection.sh
 ```
 
 The output trajectory file is in KITTI format (12 floats per line, 3x4 row-major).
@@ -239,20 +231,8 @@ For best benchmark accuracy, use the full production config:
   --traj_file kitti_05.kitti
 ```
 
-### YAML parameter highlights
-
-The production `cf_B_eigclamp.yaml` adds three GCVO-specific knobs on top of the
-classic RKHS_BA params:
-
-| YAML key | Default | Description |
-|----------|---------|-------------|
-| `cov_eig_min` | `0.0` (off) | Clamp per-point covariance eigenvalues to this minimum. Critical floor that prevents `(Σ_a + Σ_b)^{-1}` from blowing up when KNN gives a near-degenerate Σ. KITTI prod uses `0.01`. |
-| `cov_eig_max` | `0.0` (off) | Clamp per-point covariance eigenvalues to this maximum. KITTI prod uses `10.0`. |
-| `use_ell2_in_kernel` | `1` | Add `ℓ²·I` regularization inside `(Σ_a + Σ_b + ℓ²I)^{-1}`. Set `0` for sharp anisotropic matching (KITTI prod); set `1` to soften (helps low-texture or sparse-overlap pairs). |
-| `use_connection_term` | `1` | Include the SE(3) Christoffel correction in the curvature matrix. `0` disables, `1` subtracts (correct), `2` adds (diverges — diagnostic only). |
-| `use_symmetrization` | `1` | Symmetrize `B_gn` before LDLT. `0` is usually better in practice. |
-| `use_h1_term`, `use_h2_term`, `use_h3_term` | `0` | Optional exact-Hessian correction terms. H4 (Gauss-Newton) is always active. On KITTI, none of H1/H2/H3 measurably improve the benchmark; H1 destabilizes the solver on several sequences. |
-| `kernel_euclidean_max_dist` | `inf` | Pre-filter neighbors farther than this Euclidean distance². Set to `1.0` (1 m) on dense scenes to cap kernel cost. |
+For the full YAML key reference (kernel shape, length-scale schedule, eigenvalue
+clamping, connection term, etc.), see the [GCvoParams reference](#gcvoparams-reference) below.
 
 
 ## Repository layout
@@ -394,12 +374,15 @@ so you only need to specify the values you want to override.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `kernel_type` | int | 0 | `0` = SCALAR (isotropic, same length-scale everywhere), `1` = DENSE (isotropic but with per-point covariance in the Mahalanobis distance), `2` = RESCALED (anisotropic, per-point covariance rescales the kernel) |
+| `kernel_type` | int | 0 | `0` = SCALAR (isotropic), `1` = DENSE (isotropic + per-point covariance in the Mahalanobis distance), `2` = RESCALED (anisotropic, per-point covariance rescales the kernel) |
 | `amplitude` | float | 0.1 | Amplitude of the Gaussian kernel |
-| `c_l` | float | 0.05 | Coefficient scaling the geometric length-scale |
-| `c_amplitude` | float | 1 | Coefficient scaling the feature (appearance) length-scale |
-| `sparsity_cutoff` | float | 0.0001 | Sparsity threshold -- kernel entries below this are dropped |
-| `kernel_eval_max_dist` | float | inf | Hard distance cutoff for kernel evaluation |
+| `c_l` | float | 0.05 | Feature (appearance) bandwidth — kernel σ for color/intensity differences |
+| `c_amplitude` | float | 1 | Feature-channel amplitude scale |
+| `sparsity_cutoff` | float | 0.0001 | Sparsity threshold — kernel entries below this are dropped |
+| `kernel_eval_max_dist` | float | inf | Hard distance² cutoff for kernel evaluation. Set to `1.0` on dense scenes to cap cost |
+| `use_ell2_in_kernel` | int | 1 | Add `ℓ²·I` regularization inside `(Σ_a + Σ_b + ℓ²I)^{-1}` for DENSE/RESCALED. `0` = sharp anisotropic matching, `1` = soften (helps low-texture / sparse-overlap pairs) |
+| `cov_eig_min` | float | 0.0 (off) | Clamp per-point Σ eigenvalues to this minimum. Keeps `(Σ_a + Σ_b)^{-1}` well-conditioned when KNN gives a near-degenerate Σ |
+| `cov_eig_max` | float | 0.0 (off) | Clamp per-point Σ eigenvalues to this maximum |
 
 ### Length-scale schedule for isotropic kernels
 
@@ -437,7 +420,7 @@ optimisation (coarse-to-fine).
 |-----|------|---------|-------------|
 | `use_geometry` | int | 1 | Include geometric (XYZ) kernel term |
 | `use_features` | int | 0 | Include feature (appearance) kernel term |
-| `add_connection` | int | 0 | `1` = add an antisymmetric connection term to the GN Hessian, `0` = standard GN |
+| `use_connection_term` | int | 1 | `1` = add the SE(3) Christoffel correction (`-gamma^T`) to the GN curvature matrix, `0` = standard GN |
 
 ### Misc
 
