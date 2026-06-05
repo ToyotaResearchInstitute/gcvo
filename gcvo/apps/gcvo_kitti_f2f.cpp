@@ -448,6 +448,22 @@ int main(int argc, char** argv) {
       const Eigen::Matrix4f T_0_f  = T_0_i;       // pose of frame f
       const Eigen::Matrix4f T_i_ip1 = r.T_s2t;
       T_0_i = T_0_f * T_i_ip1;
+      // Re-orthogonalize the accumulated rotation block. Each individual T_s2t
+      // is SO(3), but the chain product T_0_0 * T_0_1 * ... in float drifts off
+      // SO(3) over hundreds of frames (diagonals exceed 1.0 by O(1e-5)). Without
+      // this, downstream KITTI evaluation acos((trace-1)/2) silently zeros out
+      // small rotation errors.
+      {
+        Eigen::Matrix3f R = T_0_i.block<3, 3>(0, 0);
+        Eigen::JacobiSVD<Eigen::Matrix3f> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3f R_ortho = svd.matrixU() * svd.matrixV().transpose();
+        if (R_ortho.determinant() < 0.0f) {
+          Eigen::Matrix3f V = svd.matrixV();
+          V.col(2) *= -1.0f;
+          R_ortho = svd.matrixU() * V.transpose();
+        }
+        T_0_i.block<3, 3>(0, 0) = R_ortho;
+      }
 
       std::cout << "# frame=" << f << "->" << (f + 1)
                 << " iters=" << r.num_iters

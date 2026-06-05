@@ -874,6 +874,20 @@ int GCvoGPU<PointT>::align(const PointCloud& source,
   if (num_iters) *num_iters = it;
 
   // Return to public convention: T_s2t = inverse(T_t2s)
+  // Re-orthogonalize R via SVD: GN updates use the SO(3) exponential map (exact),
+  // but iterated float multiplications drift the rotation block off SO(3). Without
+  // this projection, downstream evaluation that uses acos((trace-1)/2) silently
+  // saturates to 0 on near-identity rotations (trace > 3 → clamp → acos(1) = 0).
+  {
+    Eigen::JacobiSVD<Eigen::Matrix3f> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3f R_ortho = svd.matrixU() * svd.matrixV().transpose();
+    if (R_ortho.determinant() < 0.0f) {
+      Eigen::Matrix3f V = svd.matrixV();
+      V.col(2) *= -1.0f;
+      R_ortho = svd.matrixU() * V.transpose();
+    }
+    R = R_ortho;
+  }
   Eigen::Matrix4f T_t2s = Eigen::Matrix4f::Identity();
   T_t2s.block<3, 3>(0, 0) = R;
   T_t2s.block<3, 1>(0, 3) = t;
